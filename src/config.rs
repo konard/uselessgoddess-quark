@@ -172,7 +172,17 @@ impl ModelConfig {
         }
     }
 
+    /// # Panics
+    ///
+    /// When `n_heads == 0`. [`Self::validate`] rejects that and is called before
+    /// anything is built, so this is a bug rather than a bad config reaching a
+    /// user -- the assertion says which, instead of leaving a bare "divide by
+    /// zero" to be traced back here.
     pub fn d_head(&self) -> usize {
+        assert!(
+            self.n_heads > 0,
+            "n_heads must be >= 1; ModelConfig::validate rejects 0 and should have run first"
+        );
         self.d_model / self.n_heads
     }
 
@@ -200,11 +210,30 @@ impl ModelConfig {
     /// first, so a bad config is diagnosed in one pass.
     pub fn validate(&self) -> Result<(), Vec<String>> {
         let mut errs = Vec::new();
-        if self.d_model % self.n_heads != 0 {
-            errs.push(format!(
-                "d_model ({}) must be divisible by n_heads ({})",
-                self.d_model, self.n_heads
-            ));
+        // Guarded first, and everything that divides by it nested inside: a
+        // remainder by zero panics, and a validator that panics on a bad config
+        // is the one input it exists to handle. The checks below are skipped
+        // rather than dropped -- "d_model must be divisible by n_heads" is not a
+        // useful thing to say about a model with no heads -- while unrelated
+        // faults are still collected, keeping this function's promise to report
+        // every violation in one pass.
+        if self.n_heads == 0 {
+            errs.push("n_heads must be >= 1".to_string());
+        } else {
+            if self.d_model % self.n_heads != 0 {
+                errs.push(format!(
+                    "d_model ({}) must be divisible by n_heads ({})",
+                    self.d_model, self.n_heads
+                ));
+            } else if self.d_head() % 2 != 0 {
+                // burn's RotaryEncoding pairs adjacent elements, so the rotated
+                // dimension must be even. Only meaningful once d_head is a whole
+                // number, hence the `else`.
+                errs.push(format!(
+                    "d_head ({}) must be even for rotary embeddings",
+                    self.d_head()
+                ));
+            }
         }
         if self.n_kv_heads == 0 || self.n_heads % self.n_kv_heads != 0 {
             errs.push(format!(
@@ -216,14 +245,6 @@ impl ModelConfig {
             errs.push(format!(
                 "n_kv_heads ({}) cannot exceed n_heads ({})",
                 self.n_kv_heads, self.n_heads
-            ));
-        }
-        // burn's RotaryEncoding pairs adjacent elements, so the rotated
-        // dimension must be even.
-        if self.d_model % self.n_heads == 0 && self.d_head() % 2 != 0 {
-            errs.push(format!(
-                "d_head ({}) must be even for rotary embeddings",
-                self.d_head()
             ));
         }
         if self.n_unique_layers == 0 {
@@ -488,6 +509,68 @@ mod tests {
             ..ModelConfig::quark_3m()
         };
         assert!(bad.validate().is_err());
+    }
+
+    /// An odd `d_head` divides evenly but still cannot be rotated, since burn's
+    /// `RotaryEncoding` pairs adjacent elements. 384 / 128 = 3: whole, and odd.
+    #[test]
+    fn validate_rejects_an_odd_head_dimension() {
+        let bad = ModelConfig {
+            n_heads: 128, // 384 / 128 = 3
+            n_kv_heads: 2,
+            ..ModelConfig::quark_3m()
+        };
+        let errs = bad.validate().expect_err("an odd d_head must be rejected");
+        assert!(
+            errs.iter().any(|e| e.contains("rotary")),
+            "the diagnosis must name the rotary constraint, got {errs:?}"
+        );
+    }
+
+    /// `n_heads = 0` has to come back as an error, not a panic. Every other
+    /// count is guarded (`n_kv_heads == 0` explicitly, `n_unique_layers` and
+    /// `n_loops` explicitly), and this one reaches `d_model % n_heads` first --
+    /// a remainder by zero, which panics.
+    ///
+    /// The distinction matters because `validate` is the function whose entire
+    /// job is to turn a bad config into a diagnosis: it is called on
+    /// deserialized JSON the user wrote by hand, and it promises to report
+    /// *every* violation in one pass. A panic reports none of them, and takes
+    /// the process with it.
+    #[test]
+    fn validate_reports_zero_heads_rather_than_dividing_by_it() {
+        let bad = ModelConfig {
+            n_heads: 0,
+            ..ModelConfig::quark_3m()
+        };
+        let errs = bad.validate().expect_err("n_heads = 0 must be rejected");
+        assert!(
+            errs.iter().any(|e| e.contains("n_heads")),
+            "the diagnosis must name n_heads, got {errs:?}"
+        );
+    }
+
+    /// The promise in `validate`'s docstring -- every violation, not just the
+    /// first -- has to survive the zero guard. A config that is broken in two
+    /// ways, one of which is `n_heads = 0`, must still report the other.
+    #[test]
+    fn a_zero_head_config_still_reports_its_other_faults() {
+        let bad = ModelConfig {
+            n_heads: 0,
+            d_emb: 512, // also > d_model
+            ..ModelConfig::quark_3m()
+        };
+        let errs = bad
+            .validate()
+            .expect_err("this config is broken twice over");
+        assert!(
+            errs.iter().any(|e| e.contains("n_heads")),
+            "the diagnosis must name n_heads, got {errs:?}"
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("d_emb")),
+            "guarding n_heads must not swallow the unrelated d_emb fault, got {errs:?}"
+        );
     }
 
     #[test]
