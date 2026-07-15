@@ -1,0 +1,16 @@
+/target
+**/*.rs.bk
+
+# Training artifacts and downloaded corpora: large, regenerable, never reviewed.
+/data
+/artifacts
+/checkpoints
+/ci-logs
+*.bin
+*.safetensors
+*.mpk
+
+# Python bits used by the analysis scripts under experiments/.
+__pycache__/
+*.pyc
+.venv/

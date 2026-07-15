@@ -1,0 +1,60 @@
+[package]
+name = "quark"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "A 3M-parameter language model family and training harness built on burn"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/uselessgoddess/quark"
+
+[dependencies]
+# `dataset` gates `burn::data::{dataset, dataloader}` -- Batcher, Dataset and
+# DataLoaderBuilder all live behind it.
+burn = { version = "0.21", default-features = false, features = [
+    "std",
+    "autodiff",
+    "dataset",
+] }
+burn-ndarray = { version = "0.21", optional = true }
+burn-wgpu = { version = "0.21", optional = true }
+burn-cuda = { version = "0.21", optional = true }
+
+anyhow = "1"
+tokenizers = { version = "0.23", default-features = false, features = ["onig", "progressbar"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rand = "0.9"
+rand_chacha = "0.9"
+memmap2 = "0.9"
+rayon = "1"
+indicatif = "0.17"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+burn-ndarray = "0.21"
+approx = "0.5"
+tempfile = "3"
+
+[features]
+# `ndarray` is the default so that `cargo test` and CI run on CPU with no GPU
+# present. Training uses `--features wgpu`.
+default = ["ndarray"]
+ndarray = ["dep:burn-ndarray", "burn/ndarray"]
+wgpu = ["dep:burn-wgpu", "burn/wgpu"]
+cuda = ["dep:burn-cuda", "burn/cuda"]
+
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+# Tests exercise real training steps; without optimization the ndarray backend
+# makes the suite unusably slow.
+[profile.test]
+opt-level = 2
+
+[profile.dev.package."*"]
+opt-level = 3
