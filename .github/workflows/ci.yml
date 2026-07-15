@@ -51,6 +51,16 @@ jobs:
       - name: Check the GPT-2 baseline agrees on the protocol
         run: python3 experiments/gpt2_baseline.py --self-test
 
+      # The fixture pins the protocol on toy strings, and both sides can pass it
+      # while still disagreeing about the real corpus -- that is not theoretical,
+      # it is the bug this script was written for: both counted words and bytes
+      # identically, but one summed them per document and the other counted them
+      # on the whole file. Every fixture case passed. This runs the real binary
+      # over a real file and diffs the sidecar against the Python. No model, no
+      # GPU, ~5 seconds.
+      - name: Check the shard denominators end to end
+        run: ./experiments/check_shard_denominators.sh
+
   wgpu:
     name: check (wgpu)
     runs-on: ubuntu-latest

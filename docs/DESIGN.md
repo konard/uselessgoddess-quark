@@ -187,17 +187,35 @@ models:
 
 | pinned | why it could drift |
 |---|---|
+| the document stream | which text each model is scored on: the article split, the per-document denominators, the EOS separators |
 | window layout and striding | off-by-one in "which token does position `t` predict"; double-scoring an overlap; padding a partial tail |
 | denominators (words, bytes) | the numerator is the model's, but the denominator is a property of the text alone and **must** be identical |
 | the formulas | averaging per-batch perplexities instead of exponentiating a total |
 | BLiMP decision and aggregation | ties; paradigm-weighting instead of pair-weighting |
 
-The gap that remains is real and worth stating: two programs that agree on a
-fixture can still disagree on something the fixture does not name. What the
-fixture buys is that the disagreement has to be somewhere other than the four
-things above. `--shard` narrows it further by cross-checking the denominators
-against the sidecar quark wrote for the same text — the tightest available check,
-since it runs on the real corpus rather than on a fixture.
+The gap that remains is real, and rather than argue that it is small, here is the
+one instance of it we have already hit. The first four rows were pinned and both
+implementations passed; the first row was not, and did not exist. Both sides
+counted words and bytes with identical functions — and then Rust summed them over
+the *documents* it had split the file into, while Python counted them on the
+*whole file*. Splitting trims each document, so the two agree on words and differ
+on bytes forever. Every fixture case passed, because the fixture pinned **how to
+count and not what to count**, and those are different questions.
+
+That is the shape of the residual risk: not a subtle numerical disagreement, but
+a question nobody thought to ask. Two things narrow it beyond the fixture, and
+both are in CI:
+
+- `experiments/check_shard_denominators.sh` runs `quark prepare` on a real file
+  through the real binary and diffs the sidecar against what the Python computes
+  independently. It also asserts that counting on the whole file *would* have
+  given a different answer — a check that cannot distinguish the two would pass
+  for free.
+- `--shard` performs the same cross-check on your actual corpus at measurement
+  time, and refuses to report a perplexity if it fails.
+
+Neither closes the gap in principle. A fixture can only pin questions someone
+asked, and this is the honest statement of what that is worth.
 
 ### 3.2 BLiMP
 
@@ -480,9 +498,9 @@ depth — matches where we landed. But:
 | Training harness (`src/train/`) | done, 19 tests |
 | Evaluation (`src/eval/`: word PPL, BLiMP, generation) | done, 26 tests |
 | GPT-2 baseline (`experiments/gpt2_baseline.py`) | done — protocol pinned by `protocol_fixture.json` (§3.1) |
-| CI | done — fmt, clippy `-D warnings`, tests, wgpu build check |
+| CI | done — fmt, clippy `-D warnings`, tests, wgpu build check, both halves of the eval protocol |
 
-101 tests, all CPU. The end-to-end harness test trains a 2-layer toy on ~600
+104 tests, all CPU. The end-to-end harness test trains a 2-layer toy on ~600
 tokens through a real `Learner` and asserts the artifacts exist; it is wiring
 verification, not training. The evaluation tests likewise assert protocol and
 wiring, not quality — an untrained model has no quality to assert.

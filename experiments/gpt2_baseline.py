@@ -40,29 +40,42 @@ So this is a **protocol match, not a code-path match**, and the gap is real:
 these are two programs that could disagree. What closes it is
 ``protocol_fixture.json``, which both implementations assert against --
 ``cargo test the_frozen_protocol`` on the Rust side, ``--self-test`` here. It
-pins the four things that could silently differ:
+pins the five things that could silently differ:
 
-1. the window layout and striding -- which tokens get scored, and once each;
-2. the denominators -- words and bytes, counted on the source text;
-3. the final formulas;
-4. BLiMP's decision rule (ties are wrong) and its pair-weighted aggregation.
+1. the document stream -- the article split, the per-document denominators, and
+   the EOS separator after each document;
+2. the window layout and striding -- which tokens get scored, and once each;
+3. the denominators -- words and bytes, counted on the source text;
+4. the final formulas;
+5. BLiMP's decision rule (ties are wrong) and its pair-weighted aggregation.
 
 Everything else *should* differ: that is the model, and the model is the thing
 being measured. ``--self-test`` runs automatically before any measurement; if it
 fails, these numbers are not comparable to quark's and must not be reported as if
 they were.
 
+Item 1 is there because of a bug, and it is worth knowing which: this script used
+to tokenize the whole file as one stream while quark split it into articles and
+summed the denominators per document. Both sides counted words and bytes with
+identical functions, and every fixture case passed -- the fixture pinned how to
+count, which is not the same question as what to count. Splitting trims each
+document, so the two agreed on words and disagreed on bytes on every real corpus.
+Hence ``--split-articles`` below: pass it iff ``quark prepare`` was given it.
+
 Usage
 -----
 
     pip install torch transformers
-    python experiments/gpt2_baseline.py --text data/wikitext-103/test.txt
+    python experiments/gpt2_baseline.py --text wiki.test.tokens --split-articles
     python experiments/gpt2_baseline.py --blimp data/blimp/
     python experiments/gpt2_baseline.py --self-test    # no model needed
 
 ``--shard`` additionally cross-checks the denominators against the sidecar quark
 wrote for the same text, which is the tightest available proof that both are
-dividing by the same number.
+dividing by the same number -- and the check the fixture cannot perform, since
+the fixture does not know what ``quark prepare`` did to your file. See also
+``experiments/check_shard_denominators.sh``, which proves the same thing end to
+end on a corpus built by the real binary, and runs in CI.
 """
 
 import argparse
@@ -93,6 +106,80 @@ def count_words(text: str) -> int:
 def count_bytes(text: str) -> int:
     """Rust: `str::len()`, which is already a UTF-8 byte count."""
     return len(text.encode("utf-8"))
+
+
+def _lines_inclusive(text: str):
+    """Rust: `str::split_inclusive('\\n')`.
+
+    Hand-rolled rather than `str.splitlines(keepends=True)`, which also splits on
+    `\\v`, `\\f`, `\\x1c` and `\\u2028` -- none of which Rust's `split_inclusive('\\n')`
+    treats as a break. A WikiText article containing any of them would be split
+    into different documents by the two implementations, and the denominators
+    would silently diverge.
+    """
+    start = 0
+    for i, ch in enumerate(text):
+        if ch == "\n":
+            yield text[start : i + 1]
+            start = i + 1
+    if start < len(text):
+        yield text[start:]
+
+
+def split_wikitext_articles(text: str):
+    """Rust: `split_wikitext_articles` (src/data/mod.rs).
+
+    WikiText marks an article with a ` = Title = ` line and a section with
+    ` = = Section = = `, so the article rule is "one leading `= `, and not two".
+    Each document is trimmed and empty ones are dropped, which is why the
+    denominators must be summed per document rather than counted on the whole
+    file -- see `corpus_denominators`.
+    """
+    articles = []
+    start = cursor = 0
+    for line in _lines_inclusive(text):
+        t = line.strip()
+        is_article_heading = t.startswith("= ") and t.endswith(" =") and not t.startswith("= = ")
+        if is_article_heading and cursor > start:
+            articles.append(text[start:cursor].strip())
+            start = cursor
+        cursor += len(line)
+    if cursor > start:
+        articles.append(text[start:cursor].strip())
+    return [a for a in articles if a]
+
+
+def documents(text: str, split_articles: bool):
+    """Rust: the `docs` binding in `prepare_shard` (src/data/mod.rs)."""
+    return split_wikitext_articles(text) if split_articles else [text]
+
+
+def corpus_denominators(docs):
+    """Rust: `ShardWriter::push_document`'s tallies (src/data/shard.rs).
+
+    Summed over documents, *not* counted on the whole file. Splitting trims each
+    document, so the two agree on words but not on bytes: the whitespace between
+    articles belongs to no document and is not part of any denominator. Counting
+    bytes on the whole file instead would divide quark and GPT-2 by different
+    numbers and call the difference a result.
+    """
+    return sum(count_words(d) for d in docs), sum(count_bytes(d) for d in docs)
+
+
+def build_stream(doc_tokens, eos_id: int):
+    """Rust: `ShardWriter::push_document`'s writes (src/data/shard.rs).
+
+    Each document's tokens, then one EOS separator. The separator is ours, not
+    the corpus's: the model must predict it, so it lands in the numerator, but it
+    counts toward neither denominator. That costs us a little perplexity for
+    tokens the text never contained -- which is the conservative direction, and
+    the direction both models are charged in.
+    """
+    stream = []
+    for tokens in doc_tokens:
+        stream.extend(tokens)
+        stream.append(eos_id)
+    return stream
 
 
 def windows(n_tokens: int, seq_len: int, stride: int):
@@ -170,6 +257,28 @@ def self_test() -> int:
         if n_scored != case["n_scored"]:
             failures.append(f"{case['name']}: n_scored {n_scored} != {case['n_scored']}")
 
+    for case in fixture["document_stream"]["cases"]:
+        docs = split_wikitext_articles(case["text"])
+        if docs != case["documents"]:
+            failures.append(f"split {case['name']!r}: {docs} != {case['documents']}")
+        got = corpus_denominators(docs)
+        want = (case["n_words"], case["n_bytes"])
+        if got != want:
+            failures.append(f"denominators {case['name']!r}: {got} != {want}")
+        # The fixture records what the whole file would have counted precisely so
+        # that "summed per document" cannot quietly become "counted on the file"
+        # in either implementation. Where the two differ, this asserts the
+        # difference is real rather than a stale note.
+        whole = (count_words(case["text"]), count_bytes(case["text"]))
+        want_whole = (case["whole_file_n_words"], case["whole_file_n_bytes"])
+        if whole != want_whole:
+            failures.append(f"whole-file counts {case['name']!r}: {whole} != {want_whole}")
+
+    stream = fixture["document_stream"]["stream"]
+    got = build_stream(stream["documents"], stream["eos_id"])
+    if got != stream["tokens"]:
+        failures.append(f"stream layout: {got} != {stream['tokens']}")
+
     for case in fixture["denominators"]["cases"]:
         text = case["text"]
         if count_words(text) != case["n_words"]:
@@ -220,22 +329,28 @@ def self_test() -> int:
 # ---------------------------------------------------------------------------
 
 
-def check_denominators(text: str, shard_path: pathlib.Path) -> None:
+def check_denominators(ours, shard_path: pathlib.Path) -> None:
     """Cross-check our counts against the sidecar quark wrote for the same text.
 
     The numerator of word perplexity is the model's; the denominator is the
-    text's, and it must be byte-identical between the two implementations or the
-    comparison means nothing. This is the one place we can prove it on the real
-    corpus rather than on a fixture.
+    text's, and it must be identical between the two implementations or the
+    comparison means nothing. The fixture proves the two counters agree on toy
+    strings; this proves they agree on the actual corpus, which additionally
+    catches the case the fixture cannot see -- the same counter run over a
+    different document set.
     """
     meta = json.loads(shard_path.with_suffix(".json").read_text())
-    ours = (count_words(text), count_bytes(text))
     theirs = (meta["n_words"], meta["n_bytes"])
-    if ours != theirs:
+    if tuple(ours) != theirs:
         raise SystemExit(
             f"denominator mismatch: this script counts {ours[0]} words / {ours[1]} bytes, "
-            f"{shard_path.with_suffix('.json')} records {theirs[0]} / {theirs[1]}. Either the "
-            f"shard was built from different text, or the two word counters disagree. Fix that "
+            f"{shard_path.with_suffix('.json')} records {theirs[0]} / {theirs[1]}.\n"
+            f"\n"
+            f"Most likely the two disagree about --split-articles: pass it here iff `quark "
+            f"prepare` was given it, since splitting trims each document and drops the bytes "
+            f"between articles. Otherwise the shard was built from different text.\n"
+            f"\n"
+            f"Either way both models are no longer dividing by the same number, so fix this "
             f"before reporting any perplexity."
         )
     print(f"denominators agree with {shard_path.with_suffix('.json')}: "
@@ -345,14 +460,25 @@ def measure_corpus(args, model, tok, device) -> int:
     import torch
 
     text = pathlib.Path(args.text).read_text(encoding="utf-8")
-    n_words, n_bytes = count_words(text), count_bytes(text)
+
+    # Mirror `quark prepare`: the same document split, so both models are scored
+    # over the same document set and divided by the same denominators. Tokenizing
+    # the whole file here instead would look equivalent and would not be -- it
+    # would hand GPT-2 the inter-article whitespace that quark's documents trim
+    # away, in both the numerator and the byte denominator.
+    docs = documents(text, args.split_articles)
+    n_words, n_bytes = corpus_denominators(docs)
     if args.shard:
-        check_denominators(text, pathlib.Path(args.shard))
+        check_denominators((n_words, n_bytes), pathlib.Path(args.shard))
 
     # GPT-2's own BPE, not quark's. This is the point: each model is measured
     # with the tokenizer it was trained with, and the results are only comparable
-    # because the *denominator* is not a token count.
-    ids = tok(text, return_tensors=None)["input_ids"]
+    # because the *denominator* is not a token count. The EOS separator is GPT-2's
+    # own <|endoftext|> rather than quark's id 0 -- a different id for the same
+    # role, which is what "the same protocol" means across two tokenizers.
+    ids = build_stream(
+        [tok(d, return_tensors=None)["input_ids"] for d in docs], tok.eos_token_id
+    )
     n_tokens = len(ids)
     ids_t = torch.tensor(ids, dtype=torch.long)
 
@@ -383,7 +509,8 @@ def measure_corpus(args, model, tok, device) -> int:
 
     coverage = n_scored / (n_tokens - 1)
     print(
-        f"\n{args.model} on {args.text}, seq_len={seq_len} stride={stride}\n"
+        f"\n{args.model} on {args.text}, seq_len={seq_len} stride={stride}, "
+        f"{len(docs)} document(s)\n"
         f"\n"
         f"word perplexity      {word_ppl(total_nll, n_words):>12.3f}   <- the comparable number\n"
         f"bits per byte        {bits_per_byte(total_nll, n_bytes):>12.4f}   <- also comparable\n"
@@ -424,6 +551,9 @@ def main() -> int:
                    help="check this script against protocol_fixture.json and exit; needs no model")
     p.add_argument("--text", help="the raw text split to measure perplexity on, e.g. wikitext-103 test")
     p.add_argument("--blimp", help="BLiMP .jsonl directory; scores the baseline quark's BLiMP is compared to")
+    p.add_argument("--split-articles", action="store_true",
+                   help="split on ` = Article = ` headings, exactly as `quark prepare "
+                        "--split-articles` does; pass it iff the shard was built with it")
     p.add_argument("--shard", help="quark's shard for the same text; cross-checks the denominators")
     p.add_argument("--model", default="gpt2", help="HuggingFace id; `gpt2` is the 124M checkpoint")
     p.add_argument("--seq-len", type=int, default=512,

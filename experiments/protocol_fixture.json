@@ -92,12 +92,89 @@
     ]
   },
 
+  "document_stream": {
+    "_comment": [
+      "How a corpus file becomes the token stream that gets scored. Rust:",
+      "split_wikitext_articles and prepare_shard (src/data/mod.rs) plus",
+      "ShardWriter::push_document (src/data/shard.rs). Python: split_wikitext_articles,",
+      "documents, corpus_denominators, build_stream.",
+      "",
+      "This section exists because of a bug it would have caught. The two",
+      "implementations agreed on every counting function below and still measured",
+      "different things: Rust split WikiText into articles and summed the",
+      "denominators per document, while Python tokenized the whole file as one",
+      "stream. Same counters, different text, and no test could see it -- the",
+      "'denominators' section pins how to count, and that is not the same question",
+      "as what to count."
+    ],
+    "split_rule": [
+      "WikiText writes an article heading as ` = Title = ` and a section heading as",
+      "` = = Section = = `, so an article starts at a trimmed line that begins with",
+      "'= ', ends with ' =', and does NOT begin with '= = '. Lines are split on '\\n'",
+      "only -- not on \\v, \\f, \\x1c or \\u2028, which Python's splitlines() would also",
+      "break on and Rust's split_inclusive('\\n') would not.",
+      "",
+      "Each document is trimmed; empty ones are dropped. Splitting therefore",
+      "preserves every word but NOT every byte, which is the whole point of the",
+      "'trimming loses bytes' case below."
+    ],
+    "cases": [
+      {
+        "name": "article headings split, section headings do not",
+        "text": "\n = Valkyria Chronicles III = \n\n Senjo no Valkyria 3 is a game .\n\n = = Gameplay = = \n\n It is a tactical RPG .\n\n = Tower Building = \n\n The Tower Building of the Little Rock Arsenal .\n",
+        "documents": [
+          "= Valkyria Chronicles III = \n\n Senjo no Valkyria 3 is a game .\n\n = = Gameplay = = \n\n It is a tactical RPG .",
+          "= Tower Building = \n\n The Tower Building of the Little Rock Arsenal ."
+        ],
+        "n_words": 37,
+        "n_bytes": 176,
+        "whole_file_n_words": 37,
+        "whole_file_n_bytes": 182,
+        "_note": "The two byte counts differ -- 176 vs 182 -- because trimming discards the whitespace around each article. The word counts do not. That asymmetry is exactly why bits-per-byte must be summed per document: counting it on the whole file would divide quark and GPT-2 by different numbers and report the difference as a result."
+      },
+      {
+        "name": "text without an article heading is one document",
+        "text": "just some prose\nover two lines\n",
+        "documents": ["just some prose\nover two lines"],
+        "n_words": 6,
+        "n_bytes": 30,
+        "whole_file_n_words": 6,
+        "whole_file_n_bytes": 31,
+        "_note": "One document, and still a byte short of the file: the trailing newline belongs to no document."
+      },
+      {
+        "name": "empty text yields no documents",
+        "text": "",
+        "documents": [],
+        "n_words": 0,
+        "n_bytes": 0,
+        "whole_file_n_words": 0,
+        "whole_file_n_bytes": 0
+      }
+    ],
+    "stream": {
+      "_comment": [
+        "Each document's tokens, then one EOS separator. The separator is ours, not",
+        "the corpus's: the model must predict it, so it is scored, but it counts",
+        "toward neither denominator. The id differs between the models -- 0 for",
+        "quark, 50256 (<|endoftext|>) for GPT-2 -- because the role is what is",
+        "shared, not the number."
+      ],
+      "documents": [[1, 2, 3], [4]],
+      "eos_id": 0,
+      "tokens": [1, 2, 3, 0, 4, 0]
+    }
+  },
+
   "denominators": {
     "_comment": [
       "The numerator of word perplexity is model-specific; the denominator is a",
       "property of the text alone, and must be identical for every model or the",
       "comparison is meaningless. Both are counted on the *source text*, before",
-      "tokenization and before our own EOS separators are inserted."
+      "tokenization and before our own EOS separators are inserted.",
+      "",
+      "This pins how to count. 'document_stream' above pins what to count -- the",
+      "documents, not the file. Agreeing on one and not the other is not agreement."
     ],
     "words": "text.split_whitespace().count() in Rust == len(text.split()) in Python. Deliberately crude: it is the definition the published WikiText-103 counts use.",
     "bytes": "len(text.encode('utf-8')). Rust's str::len() is already this.",
