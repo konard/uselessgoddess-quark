@@ -47,31 +47,58 @@ every model in the table above is 15x–4,000x past "optimal" and none of them a
 described as overtrained. Training past Chinchilla is what you *do* when you have
 decided the parameter count in advance.
 
-Two independent measurements agree that quark is nowhere near its floor:
+The direct evidence that quark is nowhere near its floor is **perplexity**.
+MicroNet's scaling curve (ppl ∝ N^−0.315), anchored on its own measured 8.3M
+WikiText-103 test numbers, puts a 3M model at **~57.7 word ppl** (or ~48.8 with its
+cache). quark measured **108.3 (dense) and 115.2 (loop12)** — **1.9x its own size's
+floor.** Same corpus, same metric, same parameter class. The gap is not explained by
+architecture; MicroNet's recipe differs from quark's mainly in how long it ran.
 
-- **Perplexity.** MicroNet's own scaling curve (ppl ∝ N^−0.315) puts a 3M model at
-  ~54 word ppl; a Kaplan-style fit puts it at ~56. quark measured **108.3 (dense)
-  and 115.2 (loop12)** — about 2x its own size's floor.
-- **BLiMP.** quark's 58.63 is almost exactly the 58.57 mean of the three 1M-word
-  MiniBERTas. The model scores as if it had seen 1% of the data it actually saw —
-  which is the signature of a model that saw the data once and did not absorb it.
+The calibration ladder is unkind. All anchors below are Warstadt et al. Table 3 as
+printed in **arXiv:1912.00582v4** — the paper exists in more than one version with
+*different* Table 3 values (v1 has 5-gram 60.5, TXL 68.7, GPT-2 80.1), so these must
+not be mixed, and quark's own `experiments/blimp_analysis.py` already uses v4:
 
-And the calibration ladder is unkind:
+| | BLiMP | trained on |
+|---|---:|---|
+| chance | 50.0 | — |
+| no-signal floor (tie artifact, see `RESULTS.md` §6) | 54.3 | — |
+| **quark_3m_loop12** | **57.05** | 103M tok, 1 epoch, 2.87M params |
+| **quark_3m_dense** | **58.63** | 103M tok, 1 epoch, 2.87M params |
+| 5-gram | 61.2 | Gigaword, **3.1B** tokens |
+| Transformer-XL, same corpus | 69.6 | WikiText-103, **83M** tok, ~139M params |
+| GPT-2-**large** (not small) | 83.0 | WebText, ~8B tok, 774M params |
+| human (individual agreement) | 88.6 | — |
 
-| | BLiMP |
-|---|---:|
-| chance | 50.0 |
-| no-signal floor (tie artifact, see `RESULTS.md` §6) | 54.3 |
-| **quark_3m_loop12** | **57.05** |
-| **quark_3m_dense** | **58.63** |
-| a 5-gram model | 60.5 |
-| Transformer-XL, same corpus | 69.6 |
-| GPT-2 @ 100M words | 74.8 |
-| human (individual agreement) | 88.6 |
+**quark scores below a 5-gram** — though note that 5-gram saw 3.1B tokens, 30x
+quark's corpus, so this is a statement about quark's absolute weakness, not a fair
+data-matched fight. That is still not an architecture result. You do not choose
+between recursion and density from this position.
 
-**quark currently scores below a 5-gram.** That is not an architecture result. You
-do not choose between recursion and density from this position; you first find out
-what the model does when it is finished.
+### 1.1 The part of this argument that does not work
+
+Two honest corrections, both from BLiMP's own §6.3, which I would rather state than
+have a reviewer find:
+
+- **quark is not data-starved.** TXL scored 69.6 on **83M** tokens — *less* unique
+  data than quark's 103M — at 48x the parameters. So the 11-point gap to TXL is
+  capacity and optimization, not corpus size. Any framing like "it scores as if it
+  had seen 1% of its data" conflates *unique data* with *epochs* and should be
+  dropped: those are different axes, and only the epochs axis is open here.
+- **BLiMP dissociates from perplexity, by construction.** Warstadt et al. state it
+  outright: "although perplexity decreases with more training data, performance on
+  different phenomena grows at varying rates." Their fitted slopes per *doubling* of
+  data are steep for the easy phenomena (anaphor agreement 6.2 points, det-noun
+  agreement 4.3) but nearly flat for the hard ones (**NPIs 0.78, islands 0.36**).
+  Their own perplexity ladder on the Gulordava test set — 595 at 0.125M tokens, 212
+  at 1M, 92.8 at 8M, 53 at 64M — is a *data* curve, not an epoch curve.
+
+So the honest claim is narrower than "train longer and BLiMP goes up": **training to
+convergence is near-certain to fix perplexity (MicroNet reached 34.9 at 8.3M on this
+corpus by running 31 epochs), and may move BLiMP much less than the perplexity gain
+suggests** — especially on NPIs and islands, which is exactly where §2 shows the
+loop-vs-dense difference lives. That is an argument for running the experiment
+before theorising, not against it.
 
 Every BLiMP baseline in the literature trains 10–20 epochs. MicroNet used 31.
 quark used 1. **This is the single highest-leverage fact in the whole issue, and it
@@ -272,9 +299,11 @@ Three experiments, ~$20 total, none of which change the architecture, all of whi
 are prerequisite to any claim that would:
 
 1. **Train `quark_3m_dense` to convergence** — 10–30 epochs, same data, same LR
-   schedule shape re-annealed to the new horizon. Expected: word ppl toward the
-   50–60 floor, BLiMP off the 5-gram floor. If this alone lands, the issue's whole
-   framing changes and most of §4 becomes moot.
+   schedule shape re-annealed to the new horizon. **Primary metric: word
+   perplexity**, expected to fall from 108.3 toward the ~57.7 floor. BLiMP is a
+   *secondary* readout here and may move much less (§1.1) — do not treat a flat
+   BLiMP as a failed experiment. If perplexity lands, the issue's whole framing
+   changes and most of §4 becomes moot.
 2. **The discriminator for the loop hypothesis** — 12 unique layers versus 1 layer
    x 12 loops, on identical data, *with residual scaling implemented* (`RESULTS.md`
    §5). If BLiMP jumps to 65–70, the loop is real and MoR is back on the table. If
@@ -292,8 +321,13 @@ architecture at all.
 
 ## 7. What I am not confident about
 
-- The 50–60 word-ppl floor for 3M is extrapolated from MicroNet's curve and a
-  Kaplan fit, not measured. It could be optimistic.
+- The ~57.7 word-ppl floor for 3M is **extrapolated** from MicroNet's ppl ∝ N^−0.315
+  curve across a 2.9x parameter gap, not measured. It could be optimistic, and the
+  exponent is fitted on a different model family.
+- §1's core claim rests on MicroNet being a fair anchor: same corpus, same metric,
+  2.9x the parameters, 8.3x the tokens/param. If MicroNet's advantage turns out to
+  be mostly its cache and architecture rather than its epoch count, the "$5–20 fixes
+  it" estimate is too optimistic — which experiment 1 settles directly.
 - The $5–20 figure assumes rented GPU time at current spot rates and 30 epochs at
   the dense model's measured throughput; it is an order-of-magnitude claim.
 - MicroNet's numbers appear in the literature in both val and test form (33.6/32.9
