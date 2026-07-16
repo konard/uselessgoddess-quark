@@ -1,0 +1,204 @@
+Analysis of the three WikiText-103 runs reported in issue #3.
+
+Every headline number in docs/RESULTS.md comes from this script, matching the
+convention set by experiments/scaling_budget.py. Run it and the doc is
+reproducible:
+
+    python3 experiments/run_analysis.py
+
+Numbers marked MEASURED are transcribed from the issue's console output or from
+primary sources; numbers marked DERIVED are computed here. The distinction
+matters: this analysis reverses a pre-registered design decision, so it must be
+auditable which numbers are the user's observations and which are our inference.
+
+The three runs, all on WikiText-103 with an identical eval protocol:
+
+  run1  quark_3m        1 unique layer x 12 loops, d_model 384   ~11.0 GB, ~1 h
+  run2  quark_3m_dense  6 unique layers x 1 loop,  d_model 168   ~5.5 GB, ~15 m
+  run3  quark_3m_dense  same config, 10 epochs instead of 1
+
+The headline finding is NOT "run2 beat run1" -- that comparison is confounded
+(see confound_check()). It is the iso-compute identity in loop_vs_dense_identity():
+run1 already paid, in wall-clock and VRAM, for a model with 7.6x more parameters
+than it actually stored.
+
+
+==============================================================================
+1. Eval arithmetic self-consistency (DERIVED, checks MEASURED)
+==============================================================================
+Recomputing each run's reported metrics from its own total NLL.
+If these disagree, no comparison below means anything.
+
+run               token PPL           word PPL          bits/byte
+run1        35.792 vs 35.792   115.163 vs 115.163    1.2897 vs 1.2897
+run2        34.166 vs 34.166   108.275 vs 108.275    1.2730 vs 1.2730
+run3        37.657 vs 37.657   123.193 vs 123.193    1.3081 vs 1.3081
+
+  all three metrics reproduce from total NLL alone: YES
+  tokens/word = 1.3266  (word NLL = this x token NLL)
+
+  => The eval harness can be trusted. The numbers are internally consistent.
+
+==============================================================================
+2. THE IDENTITY: what run1's compute actually bought (DERIVED)
+==============================================================================
+Weight sharing reduces STORAGE, not ARITHMETIC. Looping one layer 12
+times costs exactly what 12 distinct layers cost. So consider the
+untied twin of quark_3m: same width, same depth, same FLOPs.
+
+                                quark_3m (1x12)   quark_22m (12x1)
+------------------------------------------------------------------
+d_model                                     384                384
+d_ff                                       1152               1152
+layer applications                           12                 12
+unique layers                                 1                 12
+compute-equiv params                 20,643,840         20,643,840
+STORED params                         2,868,352         21,800,320
+
+  Identical compute-equivalent params  => identical FLOPs/token
+  Identical width, depth and head count => identical activation memory
+
+  Stored params: 2,868,352 -> 21,800,320  (7.6x)
+  Extra optimizer memory for the untied weights: 0.303 GB
+  ...against run1's MEASURED 11.0 GB footprint on a 16 GB card.
+
+  The looped model's function class is a STRICT SUBSET of the dense one:
+  tie all 12 layers' weights and you recover quark_3m exactly. The dense
+  model can represent everything the looped model can, and more, at the
+  same arithmetic cost.
+
+  => run1 spent 60 min and 11.0 GB running a 20,643,840-param
+     compute graph in order to store 2,868,352 params.
+     The 3M budget was never the binding constraint. VRAM is, and VRAM is
+     consumed by activations (compute), not by stored weights.
+
+==============================================================================
+3. What run1-vs-run2 does and does NOT show (DERIVED)
+==============================================================================
+docs/DESIGN.md Sec 5 pre-registered: 'quark_3m_dense is the honest control
+-- if it matches quark_3m, looping bought nothing.' By that criterion the
+result is in, and it is worse than a match: dense WINS.
+
+                            run1 looped     run2 dense        delta
+------------------------------------------------------------------
+valid loss (nats)                 3.706          3.653       -0.053
+word PPL                        115.163        108.275       -6.888
+BLiMP %                          57.050         58.630       +1.580
+VRAM GB                          11.000          5.500       -5.500
+minutes                          60.000         15.000      -45.000
+compute-equiv params         20,643,840      1,778,112        11.6x
+stored params                 2,868,352      2,871,880
+
+  BUT: this is NOT a clean looping-vs-dense test. The two configs differ
+  on THREE axes at once:
+    width          d_model 384 vs 168
+    layer diversity      1 vs 6 unique layers
+    depth               12 vs 6 applications
+
+  So run2 shows: at a 3M budget, spending sharing's savings on WIDTH does
+  not pay for the loss of LAYER DIVERSITY. That is a real and useful
+  result -- and it is untested in the literature (nobody re-widens a looped
+  model to restore param parity) -- but it does not isolate the mechanism.
+
+  The clean test is quark_22m vs quark_3m: identical on every axis except
+  whether the 12 layer applications share one weight set. That run is the
+  experiment this analysis proposes.
+
+==============================================================================
+4. Why 10 epochs did WORSE than 1 epoch (DERIVED)
+==============================================================================
+run3 is the same config as run2, trained 10x longer, and it LOST:
+    word PPL 108.275 (1 epoch)  ->  123.193 (10 epochs)
+
+  Three explanations ruled out by the data:
+
+  (a) NOT a checkpoint-selection bug. src/train/mod.rs best_valid_loss_epoch()
+      reads the LearnerSummary, filters NaN, and min()s on valid Loss; run()
+      reloads that epoch before saving. It correctly selected epoch 3.
+
+  (b) NOT overfitting. At the epoch-6 blow-up:
+          train loss 5.033  >  valid loss 4.725
+      A memorizing model has train << valid. This is the opposite: the
+      model got worse at data it had already seen. It diverged.
+
+  (c) NOT simply 'peak LR too high'. Reconstructing the schedule:
+       epoch    LR at epoch start
+           1            1.500e-05
+           3            2.742e-03
+           5            2.067e-03
+           6            1.650e-03
+           7            1.233e-03
+          10            3.661e-04
+      The run SURVIVED epochs 1-5 at ~peak LR and blew up in epoch 6 at a
+      FALLING LR. 'Too high' does not explain a blow-up after the peak.
+
+  The one thing that IS established -- run2 vs run3 is confounded by the
+  LR schedule:
+      run2's single epoch ended FULLY ANNEALED at LR 3.0e-04
+      run3's best checkpoint (epoch 3) sat at ~2.74e-03
+        -- roughly 95% of peak, never annealed.
+      An un-annealed mid-cosine checkpoint is systematically worse than an
+      annealed one. That alone explains much of 108.28 -> 123.19 without
+      invoking overfitting at all.
+
+  ROOT CAUSE OF THE DIVERGENCE: NOT DETERMINED, and NOT DETERMINABLE from
+  the attached logs -- they cover epoch 1 only, so epochs 2-10 are
+  unobservable. That limitation is itself the finding: the harness reports
+  per-epoch MEANS, which hide a spike until it is catastrophic, and it has
+  no divergence detection. ~60% of a 10-epoch run's GPU time produced
+  nothing and left no diagnosable trace.
+
+==============================================================================
+5. Distance to GPT-2 124M (DERIVED from MEASURED)
+==============================================================================
+Target: GPT-2 124M zero-shot WikiText-103 word PPL = 37.5
+(Radford et al. 2019 Table 3; WebText excluded Wikipedia, so this is a
+genuine zero-shot number and we train in-domain -- a real edge.)
+
+run        word PPL   nats/word   gap to GPT-2   PPL ratio
+------------------------------------------------------------
+run1        115.163      4.7463        +1.1220       3.07x
+run2        108.275      4.6847        +1.0603       2.89x
+run3        123.193      4.8138        +1.1894       3.29x
+
+  Best run (run2) is 1.060 nats/word short.
+  That is a large gap, not a rounding error. Closing it is the whole task.
+
+==============================================================================
+6. BLiMP and perplexity DECOUPLE (DERIVED from MEASURED)
+==============================================================================
+run        word PPL    BLiMP %
+------------------------------
+run1        115.163      57.05
+run2        108.275      58.63
+run3        123.193      60.93
+
+  BLiMP rises monotonically 57.05 -> 58.63 -> 60.93 while run3's
+  perplexity gets WORSE. The two metrics disagree about which model is best.
+
+  Caution before leaning on any of this: these are SINGLE-SEED runs.
+  The run1-vs-run2 valid-loss delta is -0.053 nats and the
+  BLiMP delta is 1.58 points. Neither is obviously outside
+  seed noise, and at 57-61% both models sit near BLiMP's 50% chance floor,
+  a low-signal regime. Seed variance is unmeasured and should be measured.
+
+==============================================================================
+7. VRAM: calibrating the analytic model against MEASURED footprints
+==============================================================================
+                           analytic est  user MEASURED
+--------------------------------------------------------
+quark_3m (1x12)                   3.17G          11.0G
+quark_3m_dense (6x1)              0.80G           5.5G
+
+  2-point calibration: VRAM ~= 3.65 GB fixed + 2.32 x analytic
+  (CRUDE: two points, two unknowns, zero degrees of freedom. It cannot be
+  wrong on these two runs and has no evidence of being right anywhere else.
+  The scaling_budget.py model accounts only for activations; the residual is
+  params, grads, optimizer state, the autodiff graph and allocator slack.)
+
+  The load-bearing claim needs NO model at all:
+    quark_22m has the SAME compute graph as quark_3m, so the same activation
+    memory (3.17 GB analytic, identical), plus 0.30 GB of
+    extra weights+grads+Adam state. run1 MEASURED 11.0 GB on a 16 GB card.
+    => quark_22m fits, with room to spare, and takes about run1's ~60 min/epoch.
+
