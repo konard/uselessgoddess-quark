@@ -325,6 +325,20 @@ architecture at all.
 
 ## 7. What I am not confident about
 
+**On evidence grades.** These are not all the same kind of claim, and it matters:
+
+- **Measured by us** — everything in [`RESULTS.md`](RESULTS.md), rebuilt from the
+  run logs by a script, plus quark's own 108.275 / 115.163 / 57.05 / 58.63. Trust
+  these.
+- **Read out of a primary source** — the BLiMP Table 3 anchors and §6.3 slopes in
+  §1, taken from arXiv:1912.00582v4 directly.
+- **From a literature sweep, not reproduced** — most of §4 and §5: the MMLU
+  collapse figures, FunctionGemma's 96.7%, Press & Wolf's Table 6, MicroNet's
+  Appendix B, the CPU bandwidth measurements, the BabyLM history, Parameter Golf's
+  details. These come from a research pass, are cited to be checkable, and are
+  **not** independently verified here. They carry the argument's direction, not its
+  arithmetic. Check any of them before betting a quarter on it.
+
 - The ~57.7 word-ppl floor for 3M is **extrapolated** from MicroNet's ppl ∝ N^−0.315
   curve across a 2.9x parameter gap, not measured. It could be optimistic, and the
   exponent is fitted on a different model family.
