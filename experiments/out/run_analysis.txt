@@ -165,6 +165,46 @@ run3        123.193      4.8138        +1.1894       3.29x
   That is a large gap, not a rounding error. Closing it is the whole task.
 
 ==============================================================================
+5b. What the gap costs in parameters (DERIVED)
+==============================================================================
+DESIGN.md Sec 1.1 refuses to use these fits as predictions, and this
+section keeps that discipline. The absolute floors below are OWT
+nats/token from a fit whose smallest model is 44M -- 15x above quark.
+They are not forecasts of WikiText-103 word-level loss and are printed
+only so the RATIO is auditable. What survives extrapolation is the
+exchange rate: how many parameters buy how many nats, to an order of
+magnitude, under two independently-fitted laws that disagree on the
+constants.
+
+fit          floor @2.87M  floor @21.8M      drop
+--------------------------------------------------
+Hoffmann            4.280         2.990     1.291
+Besiroglu           4.553         3.168     1.385
+
+  MEASURED gap, run2 to GPT-2: 1.060 nats/word
+  Parameter multiplier that would buy 1.060 nats at N=2.87M:
+      Hoffmann      4.7x
+      Besiroglu     4.1x
+
+  Untying quark_3m buys 7.6x, for 0 extra FLOPs.
+
+  => Two fits that disagree about the constants agree the gap is
+     worth 4.1x-4.7x parameters. Untying pays 7.6x.
+     The intervention is the right SIZE for the problem -- same order
+     of magnitude, on the correct side of it.
+
+  This does NOT predict quark_22m reaches 37.50. It cannot: the fit is
+  OWT nats/token, the target is WikiText-103 nats/word, and quark is far
+  outside the fit's support. The claim is only that the one lever
+  available for free is scaled to the gap rather than dwarfed by it.
+
+  The argument that needs NO fitted constant, and is exact:
+    quark_3m's function class is a strict subset of quark_22m's (tie the
+    12 layers and you recover it). Sharing cannot raise the capacity
+    ceiling; it can only lower it. Chinchilla's N counts STORED params,
+    and sharing is precisely a reduction in stored params at fixed FLOPs.
+
+==============================================================================
 6. BLiMP and perplexity DECOUPLE (DERIVED from MEASURED)
 ==============================================================================
 run        word PPL    BLiMP %

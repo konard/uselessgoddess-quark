@@ -27,6 +27,8 @@ than it actually stored.
 from __future__ import annotations
 
 import math
+import pathlib
+import re
 from dataclasses import dataclass
 
 # ---------------------------------------------------------------------------
@@ -354,6 +356,83 @@ def gap_to_gpt2() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 5b. What the gap costs in parameters, priced by the project's own analysis.
+# ---------------------------------------------------------------------------
+
+# Chinchilla parametric fit, and the Besiroglu et al. refit that disputes it.
+# Both are transcribed from experiments/scaling_budget.py rather than re-typed
+# from the papers, so the two scripts cannot drift apart. See that file for the
+# provenance and for why both fits are carried instead of one.
+CHINCHILLA_E, CHINCHILLA_A, CHINCHILLA_ALPHA = 1.69, 406.4, 0.34
+BESIROGLU_E, BESIROGLU_A, BESIROGLU_ALPHA = 1.8172, 482.01, 0.3478
+
+FITS = (
+    ("Hoffmann", CHINCHILLA_E, CHINCHILLA_A, CHINCHILLA_ALPHA),
+    ("Besiroglu", BESIROGLU_E, BESIROGLU_A, BESIROGLU_ALPHA),
+)
+
+
+def params_to_buy_nats(nats: float, n_from: float, a: float, alpha: float) -> float | None:
+    """Parameter multiplier needed to lower the capacity floor by `nats`.
+
+    Returns None when no finite N suffices -- the floor is bounded below by E,
+    so a gap larger than the current A/N^alpha term cannot be bought with
+    parameters at all.
+    """
+    term = a / n_from**alpha
+    if nats >= term:
+        return None
+    return ((a / (term - nats)) ** (1 / alpha)) / n_from
+
+
+def price_of_the_gap() -> None:
+    section("5b. What the gap costs in parameters (DERIVED)")
+    print("DESIGN.md Sec 1.1 refuses to use these fits as predictions, and this")
+    print("section keeps that discipline. The absolute floors below are OWT")
+    print("nats/token from a fit whose smallest model is 44M -- 15x above quark.")
+    print("They are not forecasts of WikiText-103 word-level loss and are printed")
+    print("only so the RATIO is auditable. What survives extrapolation is the")
+    print("exchange rate: how many parameters buy how many nats, to an order of")
+    print("magnitude, under two independently-fitted laws that disagree on the")
+    print("constants.\n")
+
+    looped, dense = QUARK_3M.param_count(), QUARK_22M.param_count()
+    print(f"{'fit':<11} {'floor @2.87M':>13} {'floor @21.8M':>13} {'drop':>9}")
+    print("-" * 50)
+    drops = []
+    for name, e, a, alpha in FITS:
+        f0, f1 = e + a / looped**alpha, e + a / dense**alpha
+        drops.append(f0 - f1)
+        print(f"{name:<11} {f0:>13.3f} {f1:>13.3f} {f0 - f1:>9.3f}")
+
+    best = min(RUNS, key=lambda r: r.word_ppl)
+    gap = math.log(best.word_ppl) - math.log(GPT2_SMALL_WT103_WORD_PPL)
+    print(f"\n  MEASURED gap, {best.name} to GPT-2: {gap:.3f} nats/word")
+    print(f"  Parameter multiplier that would buy {gap:.3f} nats at N=2.87M:")
+    mults = []
+    for name, _e, a, alpha in FITS:
+        m = params_to_buy_nats(gap, looped, a, alpha)
+        mults.append(m)
+        print(f"      {name:<11} {m:>5.1f}x" if m else f"      {name:<11}  unreachable")
+    print(f"\n  Untying quark_3m buys {dense / looped:.1f}x, for 0 extra FLOPs.")
+
+    lo, hi = min(mults), max(mults)
+    print(f"\n  => Two fits that disagree about the constants agree the gap is")
+    print(f"     worth {lo:.1f}x-{hi:.1f}x parameters. Untying pays {dense / looped:.1f}x.")
+    print(f"     The intervention is the right SIZE for the problem -- same order")
+    print(f"     of magnitude, on the correct side of it.")
+    print("\n  This does NOT predict quark_22m reaches 37.50. It cannot: the fit is")
+    print("  OWT nats/token, the target is WikiText-103 nats/word, and quark is far")
+    print("  outside the fit's support. The claim is only that the one lever")
+    print("  available for free is scaled to the gap rather than dwarfed by it.")
+    print("\n  The argument that needs NO fitted constant, and is exact:")
+    print("    quark_3m's function class is a strict subset of quark_22m's (tie the")
+    print("    12 layers and you recover it). Sharing cannot raise the capacity")
+    print("    ceiling; it can only lower it. Chinchilla's N counts STORED params,")
+    print("    and sharing is precisely a reduction in stored params at fixed FLOPs.")
+
+
+# ---------------------------------------------------------------------------
 # 6. Does BLiMP track perplexity? (It does not.)
 # ---------------------------------------------------------------------------
 
@@ -442,15 +521,47 @@ def test_lr_reconstruction_matches_logs() -> None:
     assert abs(got3 - LOGGED_LR_END_EPOCH1_RUN3) / LOGGED_LR_END_EPOCH1_RUN3 < 1e-8, got3
 
 
+def test_scaling_constants_match_scaling_budget() -> None:
+    """The two scripts' Chinchilla constants must be identical.
+
+    price_of_the_gap() claims these are transcribed from scaling_budget.py and
+    therefore cannot drift apart. That claim is only true if something checks
+    it, so this does. Parsed rather than imported because scaling_budget.py
+    prints its report at module scope.
+    """
+    src = (pathlib.Path(__file__).parent / "scaling_budget.py").read_text()
+    # The constants are declared as tuple unpackings at module scope, e.g.
+    # "CHINCHILLA_E, CHINCHILLA_A, CHINCHILLA_B = 1.69, 406.4, 410.7".
+    theirs: dict[str, float] = {}
+    for lhs, rhs in re.findall(r"^([A-Z_][\w, ]*) = ([\d.eE+-]+(?:, *[\d.eE+-]+)*)$", src, re.M):
+        names = [n.strip() for n in lhs.split(",")]
+        values = [float(v) for v in rhs.split(",")]
+        if len(names) == len(values):
+            theirs.update(zip(names, values))
+
+    for name, ours in [
+        ("CHINCHILLA_E", CHINCHILLA_E),
+        ("CHINCHILLA_A", CHINCHILLA_A),
+        ("CHINCHILLA_ALPHA", CHINCHILLA_ALPHA),
+        ("BESIROGLU_E", BESIROGLU_E),
+        ("BESIROGLU_A", BESIROGLU_A),
+        ("BESIROGLU_ALPHA", BESIROGLU_ALPHA),
+    ]:
+        assert name in theirs, f"{name} not found in scaling_budget.py -- renamed?"
+        assert theirs[name] == ours, f"{name}: run_analysis {ours} vs scaling_budget {theirs[name]}"
+
+
 def main() -> None:
     test_matches_rust_budget()
     test_lr_reconstruction_matches_logs()
+    test_scaling_constants_match_scaling_budget()
     print(__doc__)
     check_eval_arithmetic()
     loop_vs_dense_identity()
     confound_check()
     regression_analysis()
     gap_to_gpt2()
+    price_of_the_gap()
     blimp_vs_ppl()
     vram_check()
     print()
