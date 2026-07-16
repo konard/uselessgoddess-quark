@@ -31,7 +31,7 @@ use burn::{
     },
 };
 
-use crate::train::metric::TokenPerplexityInput;
+use crate::train::metric::{GradRmsInput, TokenPerplexityInput};
 
 /// What one step reports: the scalar the optimizer descends, plus the two
 /// running totals perplexity is built from.
@@ -49,6 +49,14 @@ pub struct LmOutput<B: Backend> {
     pub sum_nll: Tensor<B, 1>,
     /// How many tokens that sum covers.
     pub n_tokens: Tensor<B, 1>,
+    /// RMS of the gradient over every parameter, or `None` where no gradient
+    /// exists.
+    ///
+    /// `Option` rather than a zero, because "not measured" and "measured zero"
+    /// are different claims and a validation pass has no gradient to report. It
+    /// is `Some` only on the training path, which is why `GradRmsMetric` is
+    /// registered on the train split alone -- see `crate::train::run`.
+    pub grad_rms: Option<Tensor<B, 1>>,
 }
 
 /// `log P(target_t | context)` at every position: `[batch, seq]`.
@@ -108,10 +116,13 @@ pub fn masked_cross_entropy<B: Backend>(
     // irrecoverably. The clamp costs one kernel and removes the failure mode.
     let loss = sum_nll.clone() / n_tokens.clone().clamp_min(1.0);
 
+    // No gradient exists yet -- `backward` has not been called, and on the
+    // validation path never will be. `TrainStep::step` fills this in.
     LmOutput {
         loss,
         sum_nll,
         n_tokens,
+        grad_rms: None,
     }
 }
 
@@ -167,21 +178,33 @@ impl<B: Backend> ItemLazy for LmOutput<B> {
     fn sync(self) -> Self::ItemSync {
         let device = &Default::default();
 
-        // One transaction rather than three `into_data()` calls: it reads all
-        // three back in a single round trip instead of stalling the queue three
-        // times.
-        let [loss, sum_nll, n_tokens] = Transaction::default()
+        // One transaction rather than an `into_data()` per tensor: it reads them
+        // all back in a single round trip instead of stalling the queue once
+        // each. `grad_rms` joins the same trip when it is present, so
+        // instrumenting the training step costs four more bytes and no extra
+        // synchronization -- and the validation path registers exactly what it
+        // registered before.
+        let mut tx = Transaction::default()
             .register(self.loss)
             .register(self.sum_nll)
-            .register(self.n_tokens)
-            .execute()
-            .try_into()
-            .expect("three registered tensors yield three data buffers");
+            .register(self.n_tokens);
+        if let Some(grad_rms) = self.grad_rms {
+            tx = tx.register(grad_rms);
+        }
+
+        // Order is the registration order, so this is a queue, not an index into
+        // something that might have moved.
+        let mut data = tx.execute().into_iter();
+        let mut next = || data.next().map(|d| Tensor::from_data(d, device));
+        let expect = "the transaction yields one buffer per registered tensor";
 
         LmOutput {
-            loss: Tensor::from_data(loss, device),
-            sum_nll: Tensor::from_data(sum_nll, device),
-            n_tokens: Tensor::from_data(n_tokens, device),
+            loss: next().expect(expect),
+            sum_nll: next().expect(expect),
+            n_tokens: next().expect(expect),
+            // Absent iff nothing was registered for it, which is exactly the
+            // condition it was `None` under on the way in.
+            grad_rms: next(),
         }
     }
 }
@@ -195,6 +218,22 @@ impl<B: Backend> Adaptor<LossInput<B>> for LmOutput<B> {
 impl<B: Backend> Adaptor<TokenPerplexityInput<B>> for LmOutput<B> {
     fn adapt(&self) -> TokenPerplexityInput<B> {
         TokenPerplexityInput::new(self.sum_nll.clone(), self.n_tokens.clone())
+    }
+}
+
+impl<B: Backend> Adaptor<GradRmsInput<B>> for LmOutput<B> {
+    /// # Panics
+    /// If the item carries no gradient RMS. burn calls `adapt` once per
+    /// registered metric per split, so this is reachable only by registering
+    /// `GradRmsMetric` on the validation split -- where there is no gradient and
+    /// the metric would be meaningless. `crate::train::run` registers it on
+    /// train alone; panicking says so rather than inventing a zero.
+    fn adapt(&self) -> GradRmsInput<B> {
+        let rms = self
+            .grad_rms
+            .clone()
+            .expect("GradRmsMetric belongs to the train split; validation computes no gradient");
+        GradRmsInput::new(rms)
     }
 }
 
@@ -426,5 +465,56 @@ mod tests {
         );
         assert_eq!(scalar(out.loss), 0.0);
         assert_eq!(scalar(out.n_tokens), 0.0);
+    }
+
+    /// `sync` registers tensors in one order and reads the results back in
+    /// another place; the two agreeing is an assumption, and a silent one. If
+    /// they ever disagree the tensors do not vanish, they *swap* -- the loss
+    /// metric would plot `n_tokens` and nothing would look broken.
+    ///
+    /// So: four values, all distinguishable, checked by identity rather than by
+    /// shape.
+    #[test]
+    fn sync_round_trips_every_field_without_permuting_them() {
+        let d = Default::default();
+        let at = |x: f32| Tensor::<TestBackend, 1>::from_data(TensorData::from([x]), &d);
+        let out = LmOutput {
+            loss: at(1.0),
+            sum_nll: at(2.0),
+            n_tokens: at(3.0),
+            grad_rms: Some(at(4.0)),
+        };
+
+        let synced = out.sync();
+
+        assert_eq!(scalar(synced.loss), 1.0);
+        assert_eq!(scalar(synced.sum_nll), 2.0);
+        assert_eq!(scalar(synced.n_tokens), 3.0);
+        assert_eq!(
+            scalar(synced.grad_rms.expect("registered, so returned")),
+            4.0
+        );
+    }
+
+    /// The absent case is the one the validation path takes on every batch, and
+    /// it is where an off-by-one in the read-back queue would show up: three
+    /// registered tensors must yield three, and the fourth read must come back
+    /// empty rather than stealing a value or panicking.
+    #[test]
+    fn sync_keeps_an_absent_grad_rms_absent() {
+        let d = Default::default();
+        let at = |x: f32| Tensor::<TestBackend, 1>::from_data(TensorData::from([x]), &d);
+        let out = LmOutput {
+            loss: at(1.0),
+            sum_nll: at(2.0),
+            n_tokens: at(3.0),
+            grad_rms: None,
+        };
+
+        let synced = out.sync();
+
+        assert_eq!(scalar(synced.loss), 1.0);
+        assert_eq!(scalar(synced.n_tokens), 3.0);
+        assert!(synced.grad_rms.is_none());
     }
 }

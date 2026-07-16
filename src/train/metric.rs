@@ -43,6 +43,135 @@ impl<B: Backend> TokenPerplexityInput<B> {
     }
 }
 
+/// What [`GradRmsMetric`] consumes: one batch's gradient RMS, already reduced to
+/// a scalar on the device.
+#[derive(Debug)]
+pub struct GradRmsInput<B: Backend> {
+    rms: Tensor<B, 1>,
+}
+
+impl<B: Backend> GradRmsInput<B> {
+    pub fn new(rms: Tensor<B, 1>) -> Self {
+        Self { rms }
+    }
+}
+
+/// Root-mean-square of the gradient over every parameter, per batch.
+///
+/// # Why RMS and not the norm
+///
+/// Because the number this has to be compared against is AdamW's `epsilon`, and
+/// epsilon is added to a *per-element* quantity: the update is
+/// `m / (sqrt(v) + eps)`, and `sqrt(v)` is an exponential average of squared
+/// per-element gradients -- i.e. an RMS. A global norm would grow with the
+/// square root of the parameter count and be comparable to nothing.
+///
+/// Wortsman et al. 2023 (arXiv:2309.14322) §3.4 measure exactly this quantity
+/// collapsing below epsilon partway through training, at which point epsilon,
+/// not the gradient, sets the update size and learning stalls. That measurement
+/// is the entire argument for this project's `epsilon = 1e-15`
+/// ([`TrainConfig::epsilon`](crate::train::TrainConfig::epsilon)), and without
+/// this metric that setting would be an article of faith: a claim about a
+/// number nobody was recording. If `GradRms` never approaches 1e-8, the change
+/// bought nothing and should be reverted.
+///
+/// # Why the per-batch value is what gets logged
+///
+/// A running mean is the wrong summary for this. The failure modes worth
+/// catching -- a spike that precedes divergence, a collapse toward epsilon --
+/// are both *departures* from the running mean, and averaging is precisely the
+/// operation that hides them. So [`Metric::update`] serializes the batch's own
+/// value; [`Numeric::running_value`] still offers the epoch mean for the
+/// dashboard.
+#[derive(Clone)]
+pub struct GradRmsMetric<B: Backend> {
+    name: MetricName,
+    last: f64,
+    sum: f64,
+    batches: usize,
+    _b: PhantomData<B>,
+}
+
+impl<B: Backend> Default for GradRmsMetric<B> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<B: Backend> GradRmsMetric<B> {
+    pub fn new() -> Self {
+        Self {
+            name: MetricName::new("GradRms".to_string()),
+            last: 0.0,
+            sum: 0.0,
+            batches: 0,
+            _b: PhantomData,
+        }
+    }
+
+    fn mean(&self) -> f64 {
+        if self.batches > 0 {
+            self.sum / self.batches as f64
+        } else {
+            0.0
+        }
+    }
+}
+
+impl<B: Backend> Metric for GradRmsMetric<B> {
+    type Input = GradRmsInput<B>;
+
+    fn name(&self) -> MetricName {
+        self.name.clone()
+    }
+
+    fn description(&self) -> Option<String> {
+        Some("sqrt(mean(g^2)) over all parameter gradients, per batch".to_string())
+    }
+
+    fn attributes(&self) -> MetricAttributes {
+        // Neither direction is "better": this is a diagnostic, not an objective.
+        // `higher_is_better` has to say something, and false is the less
+        // misleading of the two -- a gradient growing without bound is the
+        // failure this exists to catch.
+        NumericAttributes {
+            unit: None,
+            higher_is_better: false,
+        }
+        .into()
+    }
+
+    fn update(&mut self, input: &Self::Input, _metadata: &MetricMetadata) -> SerializedEntry {
+        let rms = input.rms.clone().into_scalar().elem::<f64>();
+
+        self.last = rms;
+        self.sum += rms;
+        self.batches += 1;
+
+        // Scientific notation, and with reason: this number is expected to span
+        // orders of magnitude and to be read against 1e-15. `format_float` with
+        // any fixed precision renders a grad RMS of 3e-9 as "0.00".
+        let formatted = format!("epoch {:.3e} - batch {rms:.3e}", self.mean());
+        SerializedEntry::new(formatted, NumericEntry::Value(rms).serialize())
+    }
+
+    fn clear(&mut self) {
+        self.last = 0.0;
+        self.sum = 0.0;
+        self.batches = 0;
+    }
+}
+
+impl<B: Backend> Numeric for GradRmsMetric<B> {
+    fn value(&self) -> NumericEntry {
+        NumericEntry::Value(self.last)
+    }
+
+    fn running_value(&self) -> NumericEntry {
+        NumericEntry::Value(self.mean())
+    }
+}
+
 /// Perplexity per *token*, as `exp(sum_nll / n_tokens)`.
 ///
 /// Per token, not per word or per byte: this is the training-time dashboard

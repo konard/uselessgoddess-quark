@@ -30,7 +30,7 @@ use burn::{
         composed::ComposedLrSchedulerConfig, cosine::CosineAnnealingLrSchedulerConfig,
         linear::LinearLrSchedulerConfig,
     },
-    module::Module,
+    module::{Module, ModuleVisitor, Param},
     optim::AdamWConfig,
     prelude::Backend,
     record::CompactRecorder,
@@ -46,7 +46,7 @@ use crate::{
     data::{Shard, TokenBatch, TokenBatcher, TokenDataset},
     model::QuarkLm,
     train::{
-        metric::TokenPerplexityMetric,
+        metric::{GradRmsMetric, TokenPerplexityMetric},
         output::{masked_cross_entropy, masked_z_penalty, LmOutput},
     },
     ModelConfig,
@@ -90,7 +90,31 @@ pub struct TrainConfig {
     pub beta_1: f32,
     pub beta_2: f32,
     pub epsilon: f32,
-    /// Gradients are rescaled when their global norm exceeds this.
+    /// Clip threshold applied to **each parameter tensor separately**, not to
+    /// the global gradient norm.
+    ///
+    /// This is burn's semantics, not a choice, and it is worth stating because
+    /// it is not what "clip_grad_norm 1.0" means anywhere else. GPT-2, PaLM and
+    /// nanoGPT all clip the *global* norm: one coefficient, computed over the
+    /// concatenation of every gradient, rescaling all of them together -- which
+    /// shortens the update without rotating it. burn instead computes
+    /// `sqrt(sum(g^2))` over one tensor and rescales that tensor alone
+    /// (`GradientClipping::clip_by_norm`, whose signature takes a single
+    /// `Tensor<B, D>`), and `OptimizerAdaptor` calls it once per parameter
+    /// (`burn-optim/src/optim/simple/adaptor.rs`). Per-tensor clipping gives
+    /// each tensor its own coefficient, so when it binds on some tensors and
+    /// not others it changes the update's *direction*, not just its length.
+    ///
+    /// How much that matters here is damped but not nullified by AdamW: a
+    /// gradient rescaled by a constant `c` leaves `m/sqrt(v)` unchanged, so a
+    /// clip that binds equally at every step is nearly invisible. The clip
+    /// coefficient is not constant, though -- it moves with the per-tensor norm
+    /// -- and weight decay and `epsilon` both see the raw scale.
+    ///
+    /// Whether `1.0` binds at all at this scale is unmeasured; that is what
+    /// `GradRms` in the metric log is for. Left at 1.0 rather than "fixed",
+    /// because changing it is a change to the reference run and there is no
+    /// evidence yet to justify one -- see docs/RESULTS.md §5.
     pub grad_clip_norm: f32,
     /// Coefficient on the z-loss penalty; `0.0` disables it.
     ///
@@ -319,12 +343,80 @@ fn lm_step<B: Backend>(
     )
 }
 
+/// Accumulates `sum(g^2)` and the element count across every parameter
+/// gradient, staying on the device.
+///
+/// Visiting is the only way to reach gradients of every rank at once: the
+/// `Tensor<B, D>` rank is a const generic, so a loop cannot hold them, but
+/// `visit_float` is generic over `D` and burn calls it once per parameter. Each
+/// gradient is reduced to a rank-1 scalar immediately and the scalars are summed
+/// together, so nothing rank-shaped needs storing and nothing is read back to
+/// the host here -- the single scalar rides the [`LmOutput`] transaction that
+/// was already happening.
+struct GradSumSquares<'a, B: AutodiffBackend> {
+    grads: &'a B::Gradients,
+    sum_sq: Option<Tensor<B::InnerBackend, 1>>,
+    numel: usize,
+}
+
+impl<B: AutodiffBackend> ModuleVisitor<B> for GradSumSquares<'_, B> {
+    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
+        // `grad`, not `grad_remove`: the gradients are borrowed here and handed
+        // to `TrainOutput::new` intact afterwards.
+        let Some(grad) = param.val().grad(self.grads) else {
+            // A parameter the loss does not depend on has no gradient. It
+            // contributes no squares, and must contribute no elements either --
+            // counting them would divide by a denominator the numerator never
+            // saw and silently deflate the RMS.
+            return;
+        };
+        self.numel += grad.shape().num_elements();
+        let sum_sq = grad.powf_scalar(2.0).sum();
+        self.sum_sq = Some(match self.sum_sq.take() {
+            Some(acc) => acc + sum_sq,
+            None => sum_sq,
+        });
+    }
+}
+
+impl<B: AutodiffBackend> QuarkLm<B> {
+    /// RMS of this step's gradient over every parameter, as a device scalar.
+    ///
+    /// `unscale` undoes the `grad_accumulation` division that
+    /// [`TrainStep::step`] applies before `backward`, so the number reported is
+    /// the RMS of the gradient of the *unscaled* objective. That is the
+    /// interpretable one: with `grad_accumulation = 1` it is exactly what the
+    /// optimizer receives, and above 1 it approximates it, since the accumulated
+    /// sum of `N` micro-gradients each divided by `N` is their mean. The
+    /// approximation is only loose to the extent that micro-batch gradients
+    /// disagree with each other.
+    fn grad_rms(&self, grads: &B::Gradients, unscale: f64) -> Option<Tensor<B, 1>> {
+        let mut visitor = GradSumSquares::<B> {
+            grads,
+            sum_sq: None,
+            numel: 0,
+        };
+        self.visit(&mut visitor);
+
+        let sum_sq = visitor.sum_sq?;
+        debug_assert!(
+            visitor.numel > 0,
+            "a gradient exists but covers no elements"
+        );
+        let rms = sum_sq.div_scalar(visitor.numel as f64).sqrt();
+        // Back to the autodiff backend, which is what `LmOutput<B>` holds. The
+        // value is a measurement, not part of any graph -- nothing differentiates
+        // it, and `from_inner` attaches no history.
+        Some(Tensor::from_inner(rms.mul_scalar(unscale)))
+    }
+}
+
 impl<B: AutodiffBackend> TrainStep for QuarkLm<B> {
     type Input = TokenBatch<B>;
     type Output = LmOutput<B>;
 
     fn step(&self, batch: TokenBatch<B>) -> TrainOutput<LmOutput<B>> {
-        let (item, penalty) = lm_step(self, batch, self.z_loss());
+        let (mut item, penalty) = lm_step(self, batch, self.z_loss());
 
         // The optimizer descends cross-entropy *plus* the z penalty; `item`
         // keeps the cross-entropy alone. Splitting them is what lets the
@@ -354,6 +446,10 @@ impl<B: AutodiffBackend> TrainStep for QuarkLm<B> {
         // reported metric stays the true per-token mean.
         let scaled = objective.div_scalar(self.grad_accumulation() as f64);
         let grads = scaled.backward();
+
+        // Measured from the same gradients the optimizer is about to receive,
+        // and before `TrainOutput::new` consumes them.
+        item.grad_rms = self.grad_rms(&grads, self.grad_accumulation() as f64);
 
         TrainOutput::new(self, grads, item)
     }
@@ -572,6 +668,11 @@ pub fn run<B: AutodiffBackend>(
     .metric_train_numeric(TokenPerplexityMetric::new())
     .metric_valid_numeric(TokenPerplexityMetric::new())
     .metric_train_numeric(LearningRateMetric::new())
+    // Train only, and necessarily: validation computes no gradient, so
+    // `Adaptor<GradRmsInput>` has nothing to hand this and says so by panicking.
+    // Registering it on the valid split would be a request for a number that
+    // does not exist.
+    .metric_train_numeric(GradRmsMetric::new())
     .summary();
 
     if let Some(epoch) = config.resume_from_epoch {
@@ -678,6 +779,58 @@ mod tests {
     #[test]
     fn the_reference_config_is_valid() {
         TrainConfig::default().validate().unwrap();
+    }
+
+    /// Pins what `grad_clip_norm` actually does, because it is not what the name
+    /// means anywhere else and the difference is invisible until you look.
+    ///
+    /// Global-norm clipping -- GPT-2, PaLM, nanoGPT -- computes one coefficient
+    /// over every gradient at once and rescales them all by it, which shortens
+    /// the update without rotating it. burn's `GradientClipping::Norm` cannot do
+    /// that: `clip_gradient` takes a single `Tensor<B, D>`, and `OptimizerAdaptor`
+    /// hands it one parameter at a time. So each tensor gets its own coefficient.
+    ///
+    /// The two are told apart by what survives: with gradients of norm 10 and
+    /// 0.1 and a threshold of 1.0, global clipping scales *both* by ~1/10 and the
+    /// 100:1 ratio between them is preserved; per-tensor clipping pulls the first
+    /// to 1.0, leaves the second alone at 0.1 (it is already under threshold),
+    /// and the ratio becomes 10:1. The ratio is the direction of the combined
+    /// update, so this asserts the thing that matters rather than a norm.
+    ///
+    /// If burn ever switches to global clipping, this test fails and the doc on
+    /// [`TrainConfig::grad_clip_norm`] -- and docs/RESULTS.md -- need rewriting.
+    #[test]
+    fn burn_clips_each_parameter_tensor_separately_not_the_global_norm() {
+        use burn::grad_clipping::GradientClipping;
+        type Inner = <B as AutodiffBackend>::InnerBackend;
+
+        let d = Default::default();
+        let clip = GradientClipping::Norm(1.0);
+        // Norm is `sqrt(sum(g^2))` over the whole tensor, so a constant tensor of
+        // `k/sqrt(numel)` has norm exactly `k`. Two shapes, to make it clear the
+        // rank is not what is being tested.
+        let flat = |k: f32, n: usize| -> Tensor<Inner, 1> {
+            Tensor::ones([n], &d) * (k / (n as f32).sqrt())
+        };
+        let norm = |t: Tensor<Inner, 1>| -> f32 { t.powi_scalar(2).sum().sqrt().into_scalar() };
+
+        let big = clip.clip_gradient(flat(10.0, 16));
+        let small = clip.clip_gradient(flat(0.1, 4));
+
+        let (big, small) = (norm(big), norm(small));
+        assert!(
+            (big - 1.0).abs() < 1e-3,
+            "the over-threshold tensor must be pulled to exactly the threshold, got {big}"
+        );
+        assert!(
+            (small - 0.1).abs() < 1e-3,
+            "the under-threshold tensor must be untouched -- a global clip would have shrunk it to ~0.01 -- got {small}"
+        );
+        assert!(
+            (big / small - 10.0).abs() < 0.1,
+            "per-tensor clipping must collapse the 100:1 ratio to 10:1, i.e. rotate the update; got {:.1}:1",
+            big / small
+        );
     }
 
     /// Writes the metric log burn's `FileMetricLogger` writes: one entry per
@@ -903,6 +1056,71 @@ mod tests {
         assert_eq!(loss(&out_plain), loss(&out_accumulating));
     }
 
+    /// `grad_rms` measures gradients that have already been divided by
+    /// `grad_accumulation`, and multiplies the factor back out. That undo is the
+    /// one place the number can come out wrong while still looking entirely
+    /// reasonable -- a run at `grad_accumulation = 4` would simply report a grad
+    /// RMS four times too small, with nothing to compare it against.
+    ///
+    /// The property is exact: dividing the objective by `N` divides every
+    /// gradient by `N`, so a correctly unscaled RMS cannot depend on `N` at all.
+    /// The test asserts the invariance and names the wrong answer, so a failure
+    /// says which way it broke.
+    #[test]
+    fn grad_rms_is_reported_free_of_the_grad_accumulation_scaling() {
+        let device = Default::default();
+        // Cloned after a forward pass, for the reason spelled out in
+        // `gradient_accumulation_divides_the_loss_so_the_optimizer_sees_one_batch`:
+        // burn's params initialize lazily and cloning an uninitialized one draws
+        // a fresh value.
+        let plain = QuarkLm::<B>::new(ModelConfig::tiny(), &device);
+        let _ = plain.forward(Tensor::<B, 2, Int>::zeros([1, 4], &device));
+        let accumulating = plain.clone().with_grad_accumulation(4);
+
+        let rms = |model: &QuarkLm<B>| -> f32 {
+            let batch = TokenBatch {
+                input: Tensor::<B, 2, Int>::zeros([2, 8], &device),
+                target: Tensor::<B, 2, Int>::ones([2, 8], &device),
+                score_mask: Tensor::<B, 2>::ones([2, 8], &device),
+            };
+            let out = TrainStep::step(model, batch);
+            out.item
+                .grad_rms
+                .expect("the training step measures the gradient it just computed")
+                .into_scalar()
+                .elem()
+        };
+
+        let plain_rms = rms(&plain);
+        let accumulating_rms = rms(&accumulating);
+
+        assert!(
+            plain_rms > 0.0 && plain_rms.is_finite(),
+            "the test batch must produce a gradient, got {plain_rms}"
+        );
+        assert!(
+            (accumulating_rms - plain_rms).abs() <= plain_rms * 1e-4,
+            "grad_rms must not depend on grad_accumulation: got {accumulating_rms} at 4 \
+             vs {plain_rms} at 1. Without the unscale it would read {}",
+            plain_rms / 4.0
+        );
+    }
+
+    /// Validation has no gradient, so it must report no gradient RMS rather than
+    /// a zero -- "not measured" and "measured zero" are different claims, and the
+    /// second one would plot as a grad-RMS collapse that never happened.
+    #[test]
+    fn the_validation_step_reports_no_grad_rms() {
+        let device = Default::default();
+        let model = QuarkLm::<B>::new(ModelConfig::tiny(), &device);
+        let batch = TokenBatch {
+            input: Tensor::<B, 2, Int>::zeros([2, 8], &device),
+            target: Tensor::<B, 2, Int>::ones([2, 8], &device),
+            score_mask: Tensor::<B, 2>::ones([2, 8], &device),
+        };
+        assert!(InferenceStep::step(&model, batch).grad_rms.is_none());
+    }
+
     /// The RoPE tables are sized to `max_seq_len`; a longer window would index
     /// past them. Catching it in `validate` turns a panic mid-run into a message.
     #[test]
@@ -1119,6 +1337,50 @@ mod tests {
         assert!(
             cfg.artifact_dir.join("checkpoint").exists(),
             "checkpointing must be wired up, or a long run cannot be resumed"
+        );
+
+        // The diagnostics have to survive to disk, not merely to the dashboard of
+        // a run that has since exited. The epoch-6 divergence in docs/RESULTS.md
+        // §5 is undiagnosed precisely because the artifact directory did not
+        // carry the number that would have settled it, and a metric that is
+        // registered but unlogged reproduces that failure exactly.
+        let train_epoch_1 = cfg.artifact_dir.join("train").join("epoch-1");
+        let grad_rms = train_epoch_1.join("GradRms.log");
+        assert!(
+            grad_rms.exists(),
+            "the gradient RMS must reach the artifact directory: it is the evidence \
+             for or against `epsilon = 1e-15`, and evidence only counts if it outlives the run"
+        );
+        // One serialized value per line, which is burn's format, not ours
+        // (`FileMetricLogger::log_item` writes `NumericEntry::serialize`, and that
+        // is `f64::to_string`). Worth pinning anyway: the number has to be
+        // *readable*, and `experiments/run_analysis.py` is the reader. Rust's f64
+        // Display round-trips exactly and never emits an exponent, so a grad RMS
+        // of 1e-15 lands as "0.000000000000001" -- long, lossless, parseable. The
+        // scientific notation in `GradRmsMetric::update` is the dashboard string,
+        // a different field, and this asserts the log rather than assuming the two
+        // agree.
+        let logged: Vec<f64> = std::fs::read_to_string(&grad_rms)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                line.parse().unwrap_or_else(|e| {
+                    panic!("every line must parse as a number, got {line:?}: {e}")
+                })
+            })
+            .collect();
+        assert!(
+            !logged.is_empty() && logged.iter().all(|&v| v > 0.0 && v.is_finite()),
+            "every logged gradient RMS must be positive and finite, got {logged:?}"
+        );
+        assert!(
+            !cfg.artifact_dir
+                .join("valid")
+                .join("epoch-1")
+                .join("GradRms.log")
+                .exists(),
+            "validation computes no gradient, so it must log no gradient RMS rather \
+             than a column of zeros that would plot as a collapse"
         );
     }
 
