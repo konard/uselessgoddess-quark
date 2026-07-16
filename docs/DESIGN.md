@@ -406,7 +406,9 @@ Affordable but not free — and worth doing only if it demonstrably helps
 WikiText-103. That is an experiment, not an assumption.
 
 Optimizer AdamW (**override burn's defaults**: eps 1e-5 and weight_decay 1e-4 are
-not what you want), warmup + cosine schedule, gradient clipping at norm 1.0.
+not what you want), warmup + cosine schedule, gradient clipping at norm 1.0 —
+**per parameter tensor, not global**, which is burn's semantics and not what
+"clip at norm 1.0" means in GPT-2 or nanoGPT. See RESULTS.md §6.1.
 
 ### 7.1 Initialization: burn's embedding default is wrong for a tied table
 
@@ -518,18 +520,20 @@ depth — matches where we landed. But:
 
 | component | state |
 |---|---|
-| Analysis (`experiments/scaling_budget.py`) | done |
-| Model family (`src/config.rs`, `src/model/`) | done, 29 tests |
-| Data pipeline + BPE (`src/data/`) | done, 27 tests |
-| Training harness (`src/train/`) | done, 19 tests |
+| Analysis (`experiments/scaling_budget.py`, `experiments/run_analysis.py`) | done |
+| Model family (`src/config.rs`, `src/model/`) | done, 38 tests |
+| Data pipeline + BPE (`src/data/`) | done, 24 tests |
+| Training harness (`src/train/`) | done, 37 tests |
 | Evaluation (`src/eval/`: word PPL, BLiMP, generation) | done, 26 tests |
 | GPT-2 baseline (`experiments/gpt2_baseline.py`) | done — protocol pinned by `protocol_fixture.json` (§3.1) |
 | CI | done — fmt, clippy `-D warnings`, tests, wgpu build check, both halves of the eval protocol |
 
-104 tests, all CPU. The end-to-end harness test trains a 2-layer toy on ~600
-tokens through a real `Learner` and asserts the artifacts exist; it is wiring
-verification, not training. The evaluation tests likewise assert protocol and
-wiring, not quality — an untrained model has no quality to assert.
+125 tests, all CPU. The end-to-end harness test trains a 2-layer toy on ~600
+tokens through a real `Learner` and asserts the artifacts exist — including that
+the gradient-RMS log reaches the artifact directory and parses, since a
+diagnostic that does not outlive the run is the failure RESULTS.md §5 is about.
+It is wiring verification, not training. The evaluation tests likewise assert
+protocol and wiring, not quality — an untrained model has no quality to assert.
 
 Per the issue: **no local training.** CI runs CPU microtests only; the reference
 run is the user's, on 16GB.

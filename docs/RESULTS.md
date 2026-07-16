@@ -264,6 +264,13 @@ make the next occurrence diagnosable, which is what Wortsman et al. (arXiv:2309.
 recommend: *"instabilities can be predicted before they emerge by examining the
 scaling behavior of model activation and gradient norms."*
 
+§6 item 2 builds the gradient half of that (`GradRms`, per batch, written to the
+artifact directory and asserted by the end-to-end test). The activation half —
+max attention logit — is **not built**, and §6 says so plainly rather than
+letting QK-norm's existence imply the question is closed. **Nothing in this PR
+diagnoses the epoch-6 divergence.** QK-norm and z-loss address a *hypothesis*
+about it; they are not a diagnosis, and both ship off by default.
+
 ---
 
 ## 6. What to implement, in order
@@ -272,16 +279,78 @@ Each item is sourced and each is cheap. Nothing here is speculative.
 
 1. **`quark_22m` — the controlled experiment.** ✅ *Done, this PR.* Changes
    exactly one variable versus `quark_3m`: `n_unique_layers` 1 → 12.
-2. **Per-step instrumentation** — max attention logit, grad RMS, loss spikes.
+2. **Per-step instrumentation** — grad RMS, loss spikes, max attention logit.
    Sourced above. Without it, the next divergence is equally undiagnosable.
+   **Partly done** — two of three:
+
+   - ✅ **Grad RMS** *(this PR)*: `GradRmsMetric` logs `sqrt(mean(g^2))` over every
+     parameter, per batch, to `<artifact_dir>/train/epoch-N/GradRms.log`. Per-batch
+     and not a running mean, because a spike and a collapse are both *departures*
+     from the mean, and averaging is the operation that hides them.
+   - ✅ **Loss spikes** *(already existed)*: burn's `FileMetricLogger` already
+     writes per-batch entries, which `experiments/run_analysis.py` reads. What was
+     missing in run3 was not the logging but the *retention* — the attached logs
+     cover epoch 1 only.
+   - ❌ **Max attention logit** *(not done — scoped out)*: it needs an auxiliary
+     output threaded through `QuarkLm::forward` → `Block` → `attention`, which no
+     existing path carries. QK-norm bounds the logits by construction, but **only
+     when enabled, and the reference config has it off** — so this is a real
+     remaining gap, not a solved problem. If a divergence recurs with
+     `qk_norm = false`, this is the first thing to build.
+
 3. **QK-norm** — Wortsman et al. §3.1 validate it **down to 10M params**; it is
    the standard fix for attention-logit blow-up and enables higher LR.
-4. **z-loss** — same paper. quark has neither (grep finds zero hits for both).
+   ✅ *Done, this PR*, **off by default**. Normalized **before** RoPE: RoPE is a
+   rotation and preserves L2 norm, so it commutes with RMSNorm's scaling but not
+   with its learned per-element gain (OLMo 2 and Gemma 2 both order it this way).
+
+4. **z-loss** — same paper. quark had neither (grep found zero hits for both).
+   ✅ *Done, this PR*, **off by default**. Penalizes `logsumexp(logits)^2`, which
+   cross-entropy is invariant to: the reported loss is unchanged, the gradient is
+   not.
+
 5. **AdamW ε 1e-8 → 1e-15** — Wortsman §3.4: *"Decreasing ϵ to 1e-15 improves
    loss and mitigates a collapse in grad RMS."*
+   ✅ *Done, this PR* — and this is the **only change to the reference run**, so it
+   is the one that has to be able to lose. Item 2's `GradRms` is what makes it
+   falsifiable: **if grad RMS never approaches 1e-8, epsilon bought nothing and
+   should be reverted.** Until that number exists this is a bet on a paper written
+   about larger models, not a result.
+
 6. **Seed variance.** 3 seeds of `quark_3m_dense` at 1 epoch is ~45 min total and
    tells us whether 0.053 nats means anything. Every conclusion in §2 is
-   provisional until this exists.
+   provisional until this exists. ❌ **Not done — needs the 16GB GPU**, so it is
+   yours to run; CI cannot fake it.
+
+**Why 3, 4 and 5 default to off, and 5 does not.** 3 and 4 are new knobs, so
+leaving them off keeps `quark_3m` byte-identical to the config that produced the
+reported runs — the `quark_22m` comparison in §0 only means something if exactly
+one variable moved. 5 is not a knob; it is an edit to the shared default, and it
+is the one place this PR knowingly perturbs the baseline. It is called out here
+so that a `quark_22m` result cannot later be quietly attributed to the epsilon
+change, or vice versa.
+
+### 6.1 A correction found while building item 2
+
+`grad_clip_norm`'s doc claimed gradients are rescaled when their **global** norm
+exceeds the threshold. That was false, and it is worth stating because it is what
+the name means everywhere else. burn's `GradientClipping::clip_by_norm` takes a
+single `Tensor<B, D>` and computes `sqrt(sum(g^2))` over that one tensor, and
+`OptimizerAdaptor::step` calls it once per parameter
+(`burn-optim/src/optim/simple/adaptor.rs:199-200`). GPT-2, PaLM and nanoGPT clip
+the *global* norm: one coefficient over every gradient at once, which shortens the
+update without rotating it. **burn gives each tensor its own coefficient, so it
+rotates the update.** A test now pins this by the property that discriminates the
+two: gradients of norm 10 and 0.1 clipped at 1.0 come out 1.0 and 0.1 — ratio
+10:1, where a global clip would have preserved 100:1.
+
+AdamW damps this (a gradient rescaled by a constant leaves `m/sqrt(v)` unchanged)
+but does not nullify it: the coefficient moves with the per-tensor norm, and
+weight decay and epsilon both see the raw scale.
+
+`grad_clip_norm` is **left at 1.0 regardless** — changing it would be a second
+change to the reference run, and whether 1.0 binds at all at this scale is
+unmeasured. `GradRms` is what will answer that.
 
 Explicitly **not** doing, and why:
 
@@ -352,3 +421,8 @@ That is a real paper, it is honest, and the experiments are hours, not TPU-month
   "narrower result" evaporates. Measure before building on it.
 - **`quark_22m` blows past 16 GB.** The VRAM claim needs no model — same graph as
   run1's MEASURED 11 GB, +0.30 GB — but a measurement beats an argument.
+- **`GradRms` never approaches 1e-8.** Then AdamW `epsilon = 1e-15` — the only
+  change this PR makes to the reference run — is cargo-culted from a paper about
+  larger models and should be reverted to 1e-8. This is the cheapest falsification
+  on the list: it needs no extra run, only a look at `train/epoch-N/GradRms.log`
+  from the next one.
