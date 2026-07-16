@@ -156,6 +156,39 @@ impl ModelConfig {
         }
     }
 
+    /// [`Self::quark_3m`] with the loop unrolled: 12 distinct layers instead of
+    /// one reused 12 times. Same width, same depth, same FLOPs, same activation
+    /// memory -- the *only* difference is whether the 12 layer applications
+    /// share a weight set.
+    ///
+    /// This is the control that [`Self::quark_3m_dense`] was meant to be but
+    /// isn't. `quark_3m_dense` changes width (384 -> 168), layer diversity
+    /// (1 -> 6) and depth (12 -> 6 applications) all at once, so when it wins
+    /// there is no way to say which change was responsible. This config changes
+    /// exactly one thing, which is what makes it a measurement.
+    ///
+    /// It deliberately breaks the 3.0M budget, because the runs in issue #3
+    /// showed the budget was never the binding constraint. `quark_3m` already
+    /// *ran* this compute graph -- ~11 GB and ~1 h/epoch on a 16 GB card, per
+    /// the reported run -- and spent it storing 2,868,352 parameters. Untying
+    /// costs ~0.30 GB more optimizer state and buys 7.6x the parameters at
+    /// identical arithmetic. Weight sharing optimizes storage; storage was
+    /// abundant (the checkpoint is ~11 MB) while VRAM and wall-clock were
+    /// scarce.
+    ///
+    /// The expectation is not subtle: the looped model's function class is a
+    /// strict subset of this one -- tie all 12 layers and you recover
+    /// `quark_3m` exactly -- so at equal compute this cannot be worse except
+    /// through optimization or overfitting effects. If it *is* worse, that is a
+    /// genuinely interesting result and the first thing to report.
+    pub fn quark_22m() -> Self {
+        Self {
+            n_unique_layers: 12,
+            n_loops: 1,
+            ..Self::quark_3m()
+        }
+    }
+
     /// A tiny config for tests and CI. Not intended for training.
     pub fn tiny() -> Self {
         Self {
@@ -431,23 +464,39 @@ mod tests {
         assert_eq!(total, 2_868_352);
     }
 
+    /// Every preset must be structurally valid, including the ones that are
+    /// deliberately outside the 3.0M budget.
     #[test]
-    fn all_reference_configs_are_valid_and_within_budget() {
+    fn all_reference_configs_are_valid() {
         for (name, c) in [
             ("quark_3m", ModelConfig::quark_3m()),
             ("quark_3m_deep", ModelConfig::quark_3m_deep()),
             ("quark_3m_dense", ModelConfig::quark_3m_dense()),
+            ("quark_22m", ModelConfig::quark_22m()),
             ("tiny", ModelConfig::tiny()),
         ] {
             c.validate()
                 .unwrap_or_else(|e| panic!("{name} is invalid: {e:?}"));
-            if name != "tiny" {
-                assert!(
-                    c.param_count() <= 3_000_000,
-                    "{name} exceeds the 3.0M budget: {}",
-                    c.param_count()
-                );
-            }
+        }
+    }
+
+    /// The 3.0M family, and *only* that family, is budget-constrained.
+    ///
+    /// `quark_22m` is intentionally absent: issue #3's runs showed the 3.0M
+    /// budget was never the binding constraint, so it is excluded by design
+    /// rather than by oversight. `tiny` is a test fixture, not a design point.
+    #[test]
+    fn the_3m_family_stays_within_the_3m_budget() {
+        for (name, c) in [
+            ("quark_3m", ModelConfig::quark_3m()),
+            ("quark_3m_deep", ModelConfig::quark_3m_deep()),
+            ("quark_3m_dense", ModelConfig::quark_3m_dense()),
+        ] {
+            assert!(
+                c.param_count() <= 3_000_000,
+                "{name} exceeds the 3.0M budget: {}",
+                c.param_count()
+            );
         }
     }
 
@@ -457,6 +506,57 @@ mod tests {
         assert_eq!(c.n_layer_applications(), 12);
         // The whole point of the shared-layer design.
         assert!(c.compute_equivalent_params() > 6 * c.param_count());
+    }
+
+    /// `quark_22m` is `quark_3m`'s compute graph with the weights untied, and
+    /// this test is what makes that claim checkable rather than a comment.
+    ///
+    /// It is the load-bearing fact behind the recommendation in docs/RESULTS.md:
+    /// the reported ~11 GB / ~1 h cost of the `quark_3m` run was the cost of
+    /// *this* graph. If a future edit to either preset breaks the equality, the
+    /// recommendation no longer follows and this test should fail loudly.
+    #[test]
+    fn untying_quark_3m_is_free_in_arithmetic_and_buys_parameters() {
+        let looped = ModelConfig::quark_3m();
+        let dense = ModelConfig::quark_22m();
+
+        // Identical compute: same per-layer matmuls, same number of applications.
+        assert_eq!(
+            looped.matmul_params_per_layer(),
+            dense.matmul_params_per_layer()
+        );
+        assert_eq!(looped.n_layer_applications(), dense.n_layer_applications());
+        assert_eq!(
+            looped.compute_equivalent_params(),
+            dense.compute_equivalent_params()
+        );
+        assert_eq!(
+            looped.flops_per_token(512),
+            dense.flops_per_token(512),
+            "same graph must cost the same FLOPs"
+        );
+
+        // Identical shape, so identical activation memory.
+        assert_eq!(looped.d_model, dense.d_model);
+        assert_eq!(looped.d_ff, dense.d_ff);
+        assert_eq!(looped.n_heads, dense.n_heads);
+
+        // The only difference: sharing.
+        assert_eq!(looped.n_unique_layers, 1);
+        assert_eq!(dense.n_unique_layers, 12);
+
+        // And the payoff. The looped model stores one layer's weights; the dense
+        // one stores twelve, at no arithmetic cost.
+        assert_eq!(dense.param_count(), 21_800_320);
+        assert!(
+            dense.param_count() > 7 * looped.param_count(),
+            "untying should buy ~7.6x the parameters: {} vs {}",
+            dense.param_count(),
+            looped.param_count()
+        );
+        // The looped model's compute already equals a ~20.6M dense model's, which
+        // is the point: it paid for capacity it declined to store.
+        assert_eq!(looped.compute_equivalent_params(), 20_643_840);
     }
 
     #[test]
