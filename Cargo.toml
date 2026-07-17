@@ -30,6 +30,7 @@ burn = { version = "0.21", default-features = false, features = [
 burn-ndarray = { version = "0.21", optional = true }
 burn-wgpu = { version = "0.21", optional = true }
 burn-cuda = { version = "0.21", optional = true }
+burn-rocm = { version = "0.21", optional = true }
 
 anyhow = "1"
 tokenizers = { version = "0.23", default-features = false, features = ["onig", "progressbar"] }
@@ -56,6 +57,17 @@ default = ["ndarray"]
 ndarray = ["dep:burn-ndarray", "burn/ndarray"]
 wgpu = ["dep:burn-wgpu", "burn/wgpu"]
 cuda = ["dep:burn-cuda", "burn/cuda"]
+# ROCm/HIP, for AMD cards. Untested -- nobody here has one. It is offered
+# because the alternative on AMD is wgpu, and which of the two is faster is a
+# question only someone holding the card can answer.
+#
+# `vulkan` is wgpu with a SPIR-V compiler instead of the WGSL one. It shares
+# `burn-wgpu`, so it is not a third GPU stack -- it is the same one, compiled
+# for a backend AMD drivers do better on. burn's own matmul benchmarks
+# (burn.dev/blog/sota-multiplatform-matmul) put Vulkan ahead of ROCm on the two
+# AMD cards they measured, so try this one first.
+rocm = ["dep:burn-rocm", "burn/rocm"]
+vulkan = ["dep:burn-wgpu", "burn/vulkan"]
 
 
 [profile.release]

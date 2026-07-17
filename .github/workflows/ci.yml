@@ -61,21 +61,34 @@ jobs:
       - name: Check the shard denominators end to end
         run: ./experiments/check_shard_denominators.sh
 
-  wgpu:
-    name: check (wgpu)
+  # The GPU backends, none of which a runner can execute: no runner has a GPU.
+  # `check` at least guarantees these paths still compile -- otherwise they would
+  # break silently and be discovered by the one person who can run them.
+  #
+  # `cuda` is deliberately absent: it needs a CUDA toolkit to build at all, so a
+  # check job for it would test the runner image rather than this code. `rocm`
+  # does not have that problem -- cubecl-hip-sys's build script falls back to
+  # emitting no link flags when `hipconfig` is missing from PATH, which is why it
+  # can be checked here without ROCm installed. That fallback is also why this
+  # job must stay at `check`: `cargo build` of the binary gets as far as linking
+  # and then fails with undefined `hip*` symbols. Compiling is the guarantee on
+  # offer; linking and running are not.
+  backends:
+    name: check (${{ matrix.feature }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # wgpu is the backend the model is actually trained on. vulkan is the
+        # same burn-wgpu crate with a SPIR-V compiler instead of WGSL, so it is
+        # nearly free to check. rocm is a distinct stack and untested by anyone
+        # here -- see Cargo.toml.
+        feature: [wgpu, vulkan, rocm]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      # wgpu is the backend the model is actually trained on, and no runner has a
-      # GPU to exercise it. `check` at least guarantees the primary path still
-      # compiles -- otherwise it would break silently and be discovered by the
-      # one person who can run it.
-      #
-      # `cuda` is deliberately absent: it needs a CUDA toolkit to build at all,
-      # so a check job for it would test the runner image rather than this code.
-      - name: Check the wgpu backend compiles
-        run: cargo check --no-default-features --features wgpu --all-targets
+      - name: Check the ${{ matrix.feature }} backend compiles
+        run: cargo check --no-default-features --features ${{ matrix.feature }} --all-targets

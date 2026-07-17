@@ -10,6 +10,13 @@ original goal is not achievable and why.
 **Then read [`docs/RESULTS.md`](docs/RESULTS.md).** It has the first three
 training runs, and they reverse one of DESIGN.md's central decisions.
 
+**Then [`docs/NEXT.md`](docs/NEXT.md).** `quark_22m` has now run, and RESULTS.md
+§3's prediction held: **+0.345 nats at identical FLOPs**. NEXT.md is what to do
+about it, and its answer is not an architecture change — the model has seen
+**6.5 tokens per parameter**, 0.33× Chinchilla, in one epoch. It also says no to
+replacing the tokenizer, and shows the paper that already ran that experiment at
+quark's size.
+
 ## What this claims, and what it does not
 
 The issue asks for 3M parameters matching GPT-2 124M. That is really two targets

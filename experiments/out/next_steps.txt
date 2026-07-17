@@ -1,0 +1,359 @@
+Analysis of the quark_22m run reported in issue #6, and what to do next.
+
+Every headline number in docs/NEXT.md comes from this script, matching the
+convention set by experiments/run_analysis.py. Run it and the doc is
+reproducible:
+
+    python3 experiments/next_steps.py     # -> experiments/out/next_steps.txt
+
+Numbers marked MEASURED are transcribed from the issue's console output or from
+a primary source that was read directly. Numbers marked DERIVED are computed
+here. Numbers marked UNSUPPORTED are claims that circulate, that this project
+went looking for, and that turned out to have no primary source behind them --
+they are listed because *not* acting on them is a decision too, and it should
+be auditable.
+
+The distinction is doing real work in this file. Issue #6 asks for "максимально
+классных техник" -- the coolest techniques. Most of the cool techniques in the
+small-LM literature are measured at 100M-1.5B and extrapolated down to 22M by
+people who did not run them at 22M. This script's job is to keep the fitted
+range visible next to every recommendation, because quark sits outside almost
+all of them.
+
+The single most decision-relevant fact in this file needs no literature at all:
+quark_22m was trained for ONE epoch at D/N = 6.5 tokens per parameter, which is
+0.33x Chinchilla. Everything else is second-order.
+
+
+1. THE BUDGET -- and this is the whole answer, before any technique
+   --------------------------------------------------------------------
+      DERIVED  tokens per epoch          134,709,248
+      DERIVED  compute-equiv params       20,643,840
+      DERIVED  D/N                              6.53 tokens/param
+      DERIVED  vs Chinchilla (20)               0.33x
+      DERIVED  optimizer steps                 4,111
+
+      quark_22m is not undertrained by a little. It saw 1/3 of the
+      tokens Chinchilla calls compute-optimal, in 1 epoch, and
+      Chinchilla-optimal is itself the *wrong* target here: it
+      assumes unlimited data. WikiText-103 is fixed, so the binding
+      question is repetition, not fresh tokens -- see section 3.
+
+      Every architectural idea in issue #6 is a second-order
+      correction to this first-order fact.
+
+2. THE WARMUP IS 1.2% OF THE RUN
+   --------------------------------------------------------------------
+      MEASURED warmup_batches             200
+      DERIVED  = optimizer steps           50  (/4 grad accum)
+      DERIVED  total steps               4111
+      DERIVED  warmup fraction          1.22%
+
+      burn steps the LR scheduler once per dataloader batch, so the
+      config's 200 is 200 batches, not 200 steps. Typical practice is
+      1-2% of steps, so this lands in range by accident -- but it
+      lands there for the wrong reason, and it will silently scale
+      the wrong way the moment grad_accum changes.
+
+3. UNTYING WON 0.345 NATS AT IDENTICAL FLOPs -- prediction confirmed
+   --------------------------------------------------------------------
+      Both models run the SAME compute graph: 12 layer applications,
+      d_model 384, d_ff 1152. They differ only in whether the 12
+      applications share one set of weights.
+
+      MEASURED quark_3m  (1x12 tied)   valid loss 3.706   word PPL 115.163   BLiMP 57.05
+      MEASURED quark_22m (12x1 dense)  valid loss 3.361   word PPL  74.965   BLiMP 61.76
+      DERIVED  delta                              +0.345 nats      1.54x PPL   +4.71
+
+      DERIVED  stored params   2,868,352 -> 21,800,320  (7.6x)
+      DERIVED  FLOPs/token             identical (compute-equiv params = 20,643,840 both)
+      MEASURED VRAM                    11.3 GB of 16
+
+      RESULTS.md §3 predicted this and §9 pre-registered the
+      falsification ('quark_22m fails to beat quark_3m'). It did not
+      fire. The function-class argument survives: tying is a strict
+      subset of the hypothesis class, and it cost 0.345 nats.
+
+      This is iso-FLOP, and it agrees in direction with Saunshi et al.
+      (arXiv:2502.17416). It is NOT the iso-parameter comparison that
+      paper makes, and it does not speak to it.
+
+4. THE SOFTMAX RANK CAP IS 128, AND UNTYING DID NOT LIFT IT
+   --------------------------------------------------------------------
+      MEASURED d_emb                    128   <- the cap
+      MEASURED d_model                  384
+      MEASURED vocab                   8192
+
+      quark's head factorizes as (d_model -> d_emb -> vocab), so the
+      logit matrix has rank <= 128 no matter what the body computes.
+      quark_22m untied the *layers*; the head is still a 128-rank
+      bottleneck on a 384-dim state.
+
+      This is the cheapest untested lever left, and it is untested
+      HERE as well as in the literature -- see doc §4. ALBERT's own
+      Table 3 not-shared row is monotone in E (81.3/81.7/81.8/82.3 at
+      E=64/128/256/768); the famous 'E=128 is optimal' result holds
+      only in the all-shared row, which quark_22m is no longer in.
+
+5. EPOCHS: THE ONE RECOMMENDATION FITTED AT quark's SCALE
+   --------------------------------------------------------------------
+      Muennighoff et al. (arXiv:2305.16264) Eq 17, R*_D = 15.387756.
+      Their sweep spans 7M-9B params (contains quark, incl. a literal
+      20M architecture) and D_C in {100M, 400M, 1.5B} (brackets
+      quark's 135M). Nothing else in this file can say that.
+
+      epochs   effective tokens   D'/D     gained vs the row above
+           1           134.7M   100.0%     +134.7M
+           2           265.1M   98.4%     +130.4M
+           4           501.9M   93.1%     +236.7M
+           8           892.3M   82.8%     +390.4M
+          16          1425.6M   66.1%     +533.2M
+
+      DERIVED  ceiling (infinite epochs)  2.21B effective tokens
+      DERIVED  4 epochs retains           93.1% of nominal value
+
+      Their §5, verbatim: 'best loss at around 20-60x more parameters
+      and epochs [than one-epoch compute-optimal]... one-epoch models
+      significantly under-utilize their training data.'
+
+      THE CATCH, and it is not small (their App S/Q): every run behind
+      this fit used dropout 0.1 AND weight decay 0.1. quark has NO
+      dropout. The fitted curve is for a regularized model repeating
+      data; an unregularized one is a different curve, and nobody has
+      measured it. So the recommendation is epochs AND dropout, not
+      epochs alone. They are one intervention, not two.
+
+6. INDEPENDENT CORROBORATION: nobody else trains for one epoch
+   --------------------------------------------------------------------
+      MEASURED  LTG-BERT Table 3, BLiMP vs training length:
+           ~250 epochs -> 83.2      ~1000 epochs -> 83.4
+           ~500 epochs -> 83.5      ~2000 epochs -> 83.5
+      i.e. FLAT across an 8x compute range, no overfitting at 2000.
+
+      MEASURED  2025.babylm-main.12 §2: 'most other participants
+                reported training for roughly 20 epochs.'
+      MEASURED  Wilcox et al. 2025 capped at 20 epochs with 'only a
+                2-3 point drop' vs the original's >2000.
+
+      Read together with section 5: returns saturate somewhere around
+      20 epochs, and 1 -> 4 is where the cheap part of the curve is.
+      quark has run ONE. This is the least exotic and best-supported
+      change available.
+
+7. BATCH SIZE: quark is batch-STARVED, not batch-bloated
+   --------------------------------------------------------------------
+      DERIVED  C = 6ND                   1.669e+16 FLOPs
+      DERIVED  B_opt (DeepSeek Eq 1)        59,117 tokens
+      MEASURED B_actual (16x4x512)          32,768 tokens
+      DERIVED  ratio                          1.80x
+
+      DERIVED  eta_opt (DeepSeek Eq 1)    2.92e-03
+      MEASURED lr_peak                    3.00e-03   (1.03x eta_opt)
+
+      The LR is already right, to 3%. Do not touch it while changing
+      the batch -- and note that changing the batch INVALIDATES this,
+      since eta_opt and B_opt were fitted jointly.
+
+      CAVEAT: C = 1.7e16 is below DeepSeek's fitted range. Treat the
+      absolute numbers as soft. The ORDERING is what to act on:
+      B_actual < B_opt, and a second, independently fitted law (Zhang
+      et al.'s critical batch size) puts the CBS higher still. Two
+      laws fitted by different groups on different data agree that
+      32,768 is on the small side. That is the claim.
+
+8. KAPLAN'S N ~= 12*L*d^2 APPLIES TO quark, BY COINCIDENCE
+   --------------------------------------------------------------------
+      DERIVED  attention (GQA, 2 kv heads)    2.667 d^2   (vanilla MHA: 4.000)
+      DERIVED  FFN (SwiGLU, d_ff=1152)        9.000 d^2   (vanilla MLP: 8.000)
+      DERIVED  total per layer               11.667 d^2   (vanilla:     12.000)
+      DERIVED  error vs Kaplan's 12           2.78%
+
+      DERIVED  12 layers x 11.667 d^2 = 20,643,840.0  == compute-equivalent params (20,643,840)
+
+      Two deviations from vanilla, pointing opposite ways, cancelling
+      to 2.8%. So Kaplan's and Levine's depth/width fits can be read
+      off directly. This is not a designed property; it is luck, and
+      it stops being true the moment GQA or d_ff changes.
+
+9. quark IS ALREADY 2x THINNER THAN GPT-2 SMALL
+   --------------------------------------------------------------------
+      Aspect ratio = d_model / n_layers.
+
+      DERIVED  quark                32.0   (384/12)
+      MEASURED GPT-2 small          64.0   (768/12)
+      MEASURED MobileLLM-350M       30.0   -- its *final* AR, after their search
+      MEASURED Kaplan (48,1600)     33.3
+
+      quark already sits where MobileLLM's architecture search
+      *landed*. 'Go deep and thin' is advice quark has already taken.
+      There is no large win left here -- the remaining question is
+      whether 12 is slightly too shallow, which is doc §5.
+
+10. ReLU^2 vs SwiGLU IS NOT A FLOP DECISION -- IT IS A MEMORY DECISION
+    -------------------------------------------------------------------
+      MEASURED SwiGLU d_ff                    1152   (3 matmuls)
+      DERIVED  equal-param ReLU^2 d_ff'       1728   (2 matmuls)
+
+      DERIVED  SwiGLU FFN params/layer    1,327,104
+      DERIVED  ReLU^2 FFN params/layer    1,327,104   -> identical
+      DERIVED  matmul FLOPs/token/layer   2,654,208   -> identical, both
+
+      Equal params implies equal FLOPs. The '2x cheaper' framing is
+      an artifact of comparing at equal d_ff, which is not a fair
+      comparison. What DOES change:
+
+      DERIVED  FFN activations retained/token/layer:   2304 ->  1728   (25% less)
+
+      DERIVED  FFN share of quark_22m's params:  73%
+
+      That last number is why this matters more here than in the
+      papers: quark is mostly FFN. But the only numeric equal-param
+      head-to-head that exists (arXiv:2402.03804 Table 2, at 1B) is a
+      TIE -- SwiGLU 50.53 vs ReLU^2 50.48, with ReLU^2 given 1.59%
+      MORE FFN params. Decide on engineering grounds; there is no
+      quality argument in either direction.
+
+11. SLIDING-WINDOW ATTENTION IS A PROVABLE NO-OP AT quark's CONTEXT
+    -------------------------------------------------------------------
+      MEASURED seq_len                         512
+      A w=1024 window over a <=1024 causal sequence excludes nothing
+      at any position. Not 'approximately nothing' -- the attention
+      output is bit-for-bit identical to full causal attention.
+
+      DERIVED  KV cache at 1024 ctx, fp16      6.29 MB   = 0.0393% of a 16 GB card
+
+      The memory it saves is a rounding error, and it saves it on the
+      one resource quark is not short of. Gemma 3's own Figure 6 shows
+      the curves indistinguishable at 1K context. Skip it.
+
+12. MUON: BEST-IN-CLASS COVERAGE, WORST-CASE BATCH
+    -------------------------------------------------------------------
+      DERIVED  2D body params (Muon-eligible)  20,643,840.0
+      DERIVED  embedding params (AdamW)           1,097,728
+      DERIVED  Muon-eligible fraction                94.95%
+
+      That is better coverage than any published Muon result --
+      Keller's 124M NanoGPT is ~31% embedding. quark's factorized
+      d_emb=128 is why. Structurally, this is the best case for Muon.
+
+      And yet. Keller's own Muon docstring, verbatim: 'We believe it
+      is unlikely to work well for training with small batch size.'
+      His batch is 524,288 tokens. quark's is 32,768 -- 16x smaller.
+
+      DERIVED  Newton-Schulz overhead, by his own formula T*m/B:
+               5 * 384 / 32,768 = 5.86%  (his headline: 0.7%)
+
+      ~8x his quoted overhead, and likely optimistic: a 384x384
+      Newton-Schulz on one GPU is latency-bound, not FLOP-bound.
+
+      The smallest model in the Muon paper is 399M -- 18x quark. Its
+      own Table 3 fit encodes a SHRINKING advantage (1.92x at 399M
+      degrading to 1.72x at 1.5B); the famous '2x' is the smallest-
+      model endpoint of a decaying curve, not a floor.
+
+13. THE OPTIMIZER ANSWER IS 'TUNE THE LR YOU HAVE'
+    -------------------------------------------------------------------
+      MEASURED arXiv:2509.02046 Fig 1, verbatim: 'Up to a 2x speedup
+               is achievable by tuning a single hyperparameter
+               (learning rate) in the GPT-3 recipe for a 100M model.'
+      MEASURED same paper Fig 3: 'The highest speedup is capped at
+               1.4x' -- for any alternative optimizer.
+
+      So the honest expected value of switching optimizers is ~1.3-1.4x,
+      and it is SMALLER than the gain from tuning the LR of the one you
+      already have. Three independent sources at 124M-190M converge on
+      this. AlgoPerf's 2024 winner managed 1.28x under controlled
+      conditions -- every '2x' in the literature is 60% larger than
+      anything that has survived a competition.
+
+      And the same paper's reconciliation cuts FOR AdEMAMix and
+      AGAINST Muon at quark's batch, verbatim: 'Since Mars and
+      AdEMAMix both perform gradient averaging and variance reduction,
+      these methods are advantageous in their noise-dominated small-
+      batch regime, whereas in our larger-batch setting these benefits
+      diminish and matrix-level optimizers become more competitive.'
+
+      quark IS the noise-dominated small-batch regime.
+
+14. THE NEURAL TOKENIZER: SOMEONE ALREADY RAN THIS, AT 25M
+    -------------------------------------------------------------------
+      Issue #6 asks about replacing BPE with a learned compressor.
+      Lester et al. (arXiv:2404.03626) ran that experiment at 25m --
+      quark's size class -- and it lost on both axes at once:
+
+      MEASURED  method          bits/byte   FLOPs/byte
+      MEASURED  SentencePiece        1.12      11.69M
+      MEASURED  EqualInfoAC          1.25      15.42M
+
+      DERIVED   strict Pareto domination: worse loss AND more compute.
+      MEASURED  §4, verbatim: 'Our SentencePiece baseline outperforms
+                all other methods.'
+      MEASURED  the gap WIDENS as scale falls: +0.070 bits/byte at 2b,
+                +0.130 at 25m. Small models are hurt MORE, not less.
+
+      And a harder problem than losing: a lossy latent cannot report
+      perplexity at all. LCM §2.4.1: 'cannot produce the probability
+      explicitly.' CALM (arXiv:2510.27688) §3.1: 'Standard evaluation
+      metrics like Perplexity... can no longer be computed' -- even
+      with a >99.9%-accurate codec. quark's entire evidence base is
+      word PPL and bits/byte. This would delete it.
+
+      UNSUPPORTED: 'ugly BPE fragments hurt quality'. This project
+      went looking for the evidence and found the opposite: SuperBPE
+      at 200k vocab was WORSE on bits/byte (0.7465 vs 0.7482), and
+      Schmidt et al. (arXiv:2402.18376) tested fewer-tokens-implies-
+      better directly and found it 'not to be the case'. The fragments
+      are ugly to read. There is no measurement that they are ugly to
+      learn from.
+
+15. VOCAB 8192 IS DEFENSIBLE; THE ONLY EXPERIMENT WORTH RUNNING IS 4096
+    -------------------------------------------------------------------
+      MEASURED  arXiv:2407.13623 fits N_v = 0.20 * C^0.42 -- but note
+                it fits N_v = V*d, NOT V. Its smallest IsoFLOP row is
+                3B, 136x quark. This is an extrapolation, not a fit.
+      DERIVED   three independent routes converge on V_opt ~ 3.6K-9K
+                at 22M. 8192 sits at the top of that range.
+      MEASURED  §5/Fig 7: the data-constrained optimum SHRINKS. quark
+                is data-constrained.
+
+      VERDICT: 8192 is fine, plausibly slightly large. The defensible
+      experiment is 4096 vs 8192. Never larger.
+
+      COUNTER-EVIDENCE, reported because it is real and it disagrees:
+      arXiv:2311.01955 Table 5 measures vocab 8k->40k = +5.5 BLiMP.
+      That is a MASKED model, and transfer to causal is UNVERIFIED.
+      It is the strongest argument against the paragraph above.
+
+16. BLiMP 61.76 IS NOT AS BAD AS THE LEADERBOARD MAKES IT LOOK
+    -------------------------------------------------------------------
+      The 80-84 figures quark is implicitly measured against are
+      MASKED models scored by pseudo-log-likelihood. That is not the
+      same measurement quark makes, and the difference is large:
+
+      MEASURED  Salazar et al. 2020 Table 7: BERT-base PLL 84.2 vs
+                GPT-2-345M true-LL 82.6 -- 'despite using less than
+                half the data and a third of the capacity.'
+
+      The apples-to-apples target is a CAUSAL model on quark's OWN
+      corpus, scored on full unfiltered BLiMP:
+
+      MEASURED  Transformer-XL, causal, WikiText-103, 67k BLiMP: 68.7
+                (BLiMP TACL 2020 Table 3)
+      MEASURED  quark_22m:                                    61.76
+      MEASURED  OPT-125M, causal, 10M words:                   62.6
+      MEASURED  5-gram, 3.1B words:                            60.5
+
+      quark_22m sits at OPT-125M's number with 1/6 the parameters.
+      The honest target is 68.7, not 80.
+
+      Two caveats, cutting OPPOSITE ways -- report both or neither:
+      MEASURED  BabyLM FILTERS BLiMP (13.7% removed) and warns results
+                'cannot [be] directly compare[d]' to full-BLiMP runs.
+      MEASURED  The BabyLM evaluator COUNTS TIES AS CORRECT. Its true
+                random floor is 0.543, not 0.500, and an order-blind
+                Zipf-frequency baseline scores 0.663 -- beating quark
+                while ignoring word order entirely. A causal LM never
+                ties, so it collects NONE of that credit.
+      DERIVED   => quark's 61.76 is UNDERSTATED against published
+                BabyLM figures, by an amount nobody has quantified.
+

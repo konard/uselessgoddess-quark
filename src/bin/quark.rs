@@ -36,6 +36,11 @@ enum BackendChoice {
     Wgpu,
     /// CUDA, if you have it. Faster than wgpu on NVIDIA, and less portable.
     Cuda,
+    /// wgpu again, compiled through SPIR-V rather than WGSL. On AMD this is
+    /// usually the fastest thing here; see `--backend rocm`.
+    Vulkan,
+    /// ROCm/HIP, for AMD cards. Linux only, and untested by us.
+    Rocm,
 }
 
 impl Default for BackendChoice {
@@ -43,10 +48,17 @@ impl Default for BackendChoice {
         // wgpu first: it is what the project targets, and what a 16GB consumer
         // card will actually be driven with. ndarray is the fallback only
         // because a build with no GPU feature has nothing else.
+        //
+        // vulkan outranks rocm on AMD for the reason given in Cargo.toml, and
+        // both outrank ndarray, which is not a real answer for training.
         if cfg!(feature = "wgpu") {
             Self::Wgpu
         } else if cfg!(feature = "cuda") {
             Self::Cuda
+        } else if cfg!(feature = "vulkan") {
+            Self::Vulkan
+        } else if cfg!(feature = "rocm") {
+            Self::Rocm
         } else {
             Self::Ndarray
         }
@@ -82,6 +94,8 @@ macro_rules! backend_entry {
 backend_entry!(train_ndarray, "ndarray", burn_ndarray::NdArray<f32>);
 backend_entry!(train_wgpu, "wgpu", burn_wgpu::Wgpu);
 backend_entry!(train_cuda, "cuda", burn_cuda::Cuda);
+backend_entry!(train_vulkan, "vulkan", burn_wgpu::Vulkan);
+backend_entry!(train_rocm, "rocm", burn_rocm::Rocm);
 
 /// The same, for evaluation.
 ///
@@ -109,6 +123,8 @@ macro_rules! eval_entry {
 eval_entry!(eval_ndarray, "ndarray", burn_ndarray::NdArray<f32>);
 eval_entry!(eval_wgpu, "wgpu", burn_wgpu::Wgpu);
 eval_entry!(eval_cuda, "cuda", burn_cuda::Cuda);
+eval_entry!(eval_vulkan, "vulkan", burn_wgpu::Vulkan);
+eval_entry!(eval_rocm, "rocm", burn_rocm::Rocm);
 
 #[derive(Subcommand)]
 enum Command {
@@ -330,6 +346,8 @@ fn main() -> Result<()> {
                 BackendChoice::Ndarray => train_ndarray(cfg)?,
                 BackendChoice::Wgpu => train_wgpu(cfg)?,
                 BackendChoice::Cuda => train_cuda(cfg)?,
+                BackendChoice::Vulkan => train_vulkan(cfg)?,
+                BackendChoice::Rocm => train_rocm(cfg)?,
             }
         }
         Command::Eval {
@@ -379,6 +397,8 @@ fn main() -> Result<()> {
                 BackendChoice::Ndarray => eval_ndarray(&run)?,
                 BackendChoice::Wgpu => eval_wgpu(&run)?,
                 BackendChoice::Cuda => eval_cuda(&run)?,
+                BackendChoice::Vulkan => eval_vulkan(&run)?,
+                BackendChoice::Rocm => eval_rocm(&run)?,
             };
             // stdout, not tracing: this is the artifact, and it should survive
             // being piped to a file without the log decoration.

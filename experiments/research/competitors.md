@@ -144,11 +144,49 @@ document:
    its size lands.** quark's BLiMP is not an anomaly to be debugged. It is the
    size class reporting in. The three runs' 4-point BLiMP spread is noise on
    top of a number set by the parameter count.
-3. **Batch size is load-bearing at this scale.** 2025.babylm-main.12 Table 2
-   re-ran ELC-BERT's 24M config at smaller batch sizes and BLiMP **collapsed
-   from 80.00 to 44.17-52.22 across all twelve re-runs**. GPT-BERT's own
-   ablation agrees: removing batch scheduling costs -1.1 BLiMP, its second
-   largest single hit. quark's effective batch is 16 x 4 x 512 = 32,768 tokens.
+3. ~~**Batch size is load-bearing at this scale.**~~ **RETRACTED -- the numbers
+   were right and the cause was invented.** This document previously read
+   2025.babylm-main.12 Table 2 as a dose-response curve: re-runs of ELC-BERT's
+   24M config, BLiMP collapsing 80.00 -> 44.17-52.22. Both figures are MEASURED
+   and correct. The attribution to batch size is **false, and the paper argues
+   the opposite**, on three independent grounds:
+
+   - **They say so.** §4 verbatim: *"Runs using a batch size of 32 with gradient
+     accumulation of 12 (effective batch size 384) achieves performance on GLUE
+     and MSGS that matches or exceeds that of much larger batch sizes... However,
+     **BLiMP performance seems insensitive to this** and does not increase."*
+   - **Their own rows refute it.** The `253x32 accum` and `506x16 accum` rows
+     reproduce effective batch **8096 exactly** -- the original's -- at the
+     original's 31250 steps, and still score **46.95 / 49.03**. Restoring the
+     batch does not restore BLiMP. Nor is the trend monotone: at 31250 steps,
+     batch 32/256/512 -> 50.18/50.37/52.22, a 2.0-point spread over a **16x**
+     batch range.
+   - **It is confounded, and they admit it.** LR was pinned at 0.005 while batch
+     fell 256x: *"no learning rate adjustments were made in conjunction with the
+     smaller batch sizes, which may introduce bias into the results."*
+
+   **It is a failed replication, not a curve.** BLiMP chance is 50. Every one of
+   the twelve re-runs lands at or below chance (two are *under*), while GLUE
+   holds 55.9-65.5 and MSGS is *higher* than the original everywhere. That is a
+   broken eval path, not a graded effect of batch size. **quark's 61.76 already
+   beats all twelve.**
+
+   Their footnote 2 is worth keeping for a different reason: the original authors
+   *"were using an **AMD**-based architecture... there are significant differences
+   in the implementation of synchronization and gradient accumulation between AMD
+   and NVIDIA that may have an effect on results."*
+
+   **What survives is about epochs, not batch.** Same paper, §2: *"most other
+   participants reported training for **roughly 20 epochs**"*, and Wilcox et al.
+   (2025) capped at 20 with *"only a 2-3 point drop"* versus the original's
+   &gt;2000. LTG-BERT Table 3 measures the saturation directly -- BLiMP
+   **83.2 / 83.5 / 83.4 / 83.5** across ~250/500/1000/2000 epochs, i.e. **flat
+   over an 8x compute range, with no overfitting at 2000 epochs**. quark has run
+   **one**.
+
+   GPT-BERT's batch *scheduling* ablation (-1.1 BLiMP for removing the 1M->4M
+   ramp) is a separate, intact MEASURED result and is not retracted. quark's
+   effective batch is 16 x 4 x 512 = 32,768 tokens.
 
 Two protocol warnings, both MEASURED:
 - GPT-BERT Appendix E: "the results on BLiMP greatly depend on temperature
