@@ -148,7 +148,7 @@ result that is wholly GPU-dependent**, and I want to be exact about its status:
     per backend and writes tokens/sec. Critically, it **compiles each backend
     outside the timed region**, so the first uncached backend is not charged ~12
     min of `rustc` against its throughput.
-  - `.github/workflows/gpu-experiments.yml` runs it on `[self-hosted, gpu]` and
+  - `.github/workflows/gpu-experiments.yml` runs it on `self-hosted` and
     uploads the rendered report + `results.json` as an artifact — so the outcome is
     reviewable without shelling into the runner.
 - **How to get the number:** Actions → *GPU experiments* → Run workflow (defaults

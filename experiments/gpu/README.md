@@ -29,7 +29,8 @@ EXPERIMENT_SET=quick TRAIN_BACKEND=wgpu ./experiments/gpu/run_experiments.sh
 ```
 
 or from GitHub: **Actions → GPU experiments → Run workflow**, which runs on
-`[self-hosted, gpu]` and uploads the report + `results.json` as an artifact.
+`self-hosted` (the runner's label; `gpu` is its name) and uploads the report +
+`results.json` as an artifact.
 
 ### Knobs (env vars, all optional)
 
@@ -65,7 +66,7 @@ is named in the log.
 | `gen_configs.py` | derives every `TrainConfig` from `quark train --dry-run`, so configs track the binary's defaults; encodes the §13 sweep as field edits on the `quark_22m` base |
 | `collect.py` | parses `quark eval` output + timings + `backends.json` into `results.json`; a metric that isn't in the output stays `null` |
 | `../report.py` | renders `results.json` + the frozen MEASURED baselines into `docs/report/` (figures + `REPORT.md`) |
-| `../../.github/workflows/gpu-experiments.yml` | runs the above on `[self-hosted, gpu]`, uploads the artifact |
+| `../../.github/workflows/gpu-experiments.yml` | runs the above on `self-hosted`, uploads the artifact |
 
 ## Provenance
 

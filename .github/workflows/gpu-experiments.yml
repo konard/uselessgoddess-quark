@@ -1,7 +1,7 @@
 name: GPU experiments
 
 # The one job in this repository that needs a GPU. It runs on the maintainer's
-# self-hosted runner (labelled `gpu` in the issue #8 setup) and does the work a
+# self-hosted runner and does the work a
 # hosted runner cannot: benchmark the backends against each other and train the
 # quark_22m sweep on real WikiText-103. Everything it produces -- the rendered
 # report, results.json, per-run logs -- is uploaded as an artifact, so the
@@ -49,7 +49,11 @@ concurrency:
 jobs:
   experiments:
     name: benchmark + sweep (${{ inputs.experiment-set }} on ${{ inputs.train-backend }})
-    runs-on: [self-hosted, gpu]
+    # The maintainer's runner is reached by its LABEL, which is `self-hosted`.
+    # `gpu` is the runner's *name*, not a label, so `[self-hosted, gpu]` matched
+    # nothing ("There are currently no running jobs" / "Add runs-on: self-hosted").
+    # See issue #8 discussion on PR #9.
+    runs-on: self-hosted
     # A generous ceiling over the 8h the issue allows, so a run that overshoots
     # its soft time budget is still stopped rather than pinning the GPU forever.
     timeout-minutes: 600
