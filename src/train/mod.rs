@@ -543,6 +543,84 @@ fn best_valid_loss_epoch(artifact_dir: &Path) -> Option<usize> {
         .map(|e| e.step)
 }
 
+/// The highest epoch number already recorded in `artifact_dir`'s metric logs,
+/// or `None` if it holds none.
+///
+/// This mirrors `FileMetricLogger::epochs` (`burn-train/src/logger/metric.rs`),
+/// deliberately and exactly: one level of split directories (`train/`, `valid/`),
+/// then `epoch-<n>` beneath them, and the *maximum* `n` found. What burn will
+/// read is what this has to see, or the guard below would pass a directory burn
+/// then reads more from.
+fn recorded_epochs(artifact_dir: &Path) -> Option<usize> {
+    let mut max_epoch = None;
+    // A directory that cannot be listed records nothing, which is the same
+    // answer as an empty one: this is a guard, and `run` fails on its own terms
+    // a few lines later if the path is unusable.
+    for split in std::fs::read_dir(artifact_dir).ok()?.flatten() {
+        if !split.path().is_dir() {
+            continue;
+        }
+        let Ok(epochs) = std::fs::read_dir(split.path()) else {
+            continue;
+        };
+        for epoch in epochs.flatten() {
+            if !epoch.path().is_dir() {
+                continue;
+            }
+            let name = epoch.file_name();
+            let Some(n) = name
+                .to_str()
+                .and_then(|n| n.strip_prefix("epoch-"))
+                .and_then(|n| n.parse::<usize>().ok())
+            else {
+                continue;
+            };
+            max_epoch = Some(max_epoch.map_or(n, |m: usize| m.max(n)));
+        }
+    }
+    max_epoch
+}
+
+/// Refuse to start a fresh run in a directory that already holds one.
+///
+/// This is not tidiness. burn's file metric logger truncates per epoch, so a
+/// shorter run into a used directory overwrites the epochs it reaches and
+/// *leaves the rest*, and then every consumer reads the union as one run:
+///
+///  * `FileMetricLogger::epochs` returns the maximum `epoch-<n>` on disk, so
+///    `LearnerSummary` reports `Total Epochs: <n>` and prints the old run's
+///    losses in the new run's summary table.
+///  * `MetricCheckpointingStrategy` selects through
+///    `NumericMetricsAggregate::find_epoch`, which walks epochs from 1 until one
+///    is missing and takes the best. A stale epoch that beats the new run's
+///    means the new model is never saved as best.
+///  * [`best_valid_loss_epoch`] then names that stale epoch, and `run` loads
+///    `checkpoint/model-<stale>` -- weights from *the previous architecture*.
+///
+/// This is not hypothetical: the `quark_22m` run reported in issue #6 printed
+/// `Total Epochs: 10` for a `num_epochs: 1` config, with epochs 2-10 carrying
+/// the `quark_3m_dense` numbers from the run before it (`docs/RESULTS.md` §5).
+/// It loaded the right checkpoint only because its single epoch happened to beat
+/// every stale one. That is luck, and luck is not a mechanism.
+fn refuse_to_merge_runs(artifact_dir: &Path, resume_from_epoch: Option<usize>) -> Result<()> {
+    // Resuming *wants* the previous run's logs: they are the same run.
+    if resume_from_epoch.is_some() {
+        return Ok(());
+    }
+    if let Some(epochs) = recorded_epochs(artifact_dir) {
+        bail!(
+            "{} already holds metric logs for {epochs} epoch(s) from an earlier run. Training \
+             into it would merge the two: burn reads every `epoch-<n>` it finds, so the summary \
+             would report both runs as one, and the best-checkpoint search could select -- and \
+             load -- a checkpoint from the earlier model. Remove the directory, point \
+             --artifact-dir somewhere else, or pass --resume-from-epoch to continue that run \
+             deliberately.",
+            artifact_dir.display()
+        );
+    }
+    Ok(())
+}
+
 /// Train, and return the best model by validation loss.
 ///
 /// Deliberately generic over the backend rather than hardcoding one: the issue
@@ -554,6 +632,7 @@ pub fn run<B: AutodiffBackend>(
     device: B::Device,
 ) -> Result<QuarkLm<B::InnerBackend>> {
     config.validate()?;
+    refuse_to_merge_runs(&config.artifact_dir, config.resume_from_epoch)?;
 
     let train_shard = Arc::new(
         Shard::open(&config.train_shard)
@@ -920,6 +999,69 @@ mod tests {
             best_valid_loss_epoch(&dir.path().join("does-not-exist")),
             None
         );
+    }
+
+    /// The failure `refuse_to_merge_runs` exists to prevent, demonstrated rather
+    /// than asserted about: this is what a 1-epoch run into the directory of a
+    /// finished 10-epoch run would select.
+    ///
+    /// Epoch 1 is the new run's -- burn's `FileLogger` opens with
+    /// `.truncate(true)`, so it overwrote what was there. Epochs 2-10 are the old
+    /// run's, untouched, and burn reads them as if they were this run's. The best
+    /// epoch is then epoch 3, from a model that no longer exists, and `run` would
+    /// load `checkpoint/model-3` into the new architecture.
+    #[test]
+    fn without_the_guard_a_stale_epoch_wins_the_best_checkpoint_search() {
+        let dir = tempfile::tempdir().unwrap();
+        // The new run: one epoch, and a good one.
+        write_valid_loss_log(dir.path(), 1, &[(3.361, 512)]);
+        // The old run's tail, still on disk.
+        for (epoch, loss) in [(2, 3.9), (3, 3.2), (4, 4.1)] {
+            write_valid_loss_log(dir.path(), epoch, &[(loss, 512)]);
+        }
+
+        assert_eq!(best_valid_loss_epoch(dir.path()), Some(3));
+        assert_eq!(recorded_epochs(dir.path()), Some(4));
+    }
+
+    /// So a fresh run into a used directory is refused, and the message says what
+    /// to do instead. The alternative is the run in issue #6: `num_epochs: 1`,
+    /// `Total Epochs: 10`.
+    #[test]
+    fn a_fresh_run_refuses_a_used_artifact_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        write_valid_loss_log(dir.path(), 1, &[(1.0, 4)]);
+
+        let err = refuse_to_merge_runs(dir.path(), None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("earlier run") && err.contains("--resume-from-epoch"),
+            "the error must name the cause and the way out; got: {err}"
+        );
+    }
+
+    /// Resuming reads the same logs on purpose -- it is the same run. The guard
+    /// must not stand in front of the one case that wants what it forbids.
+    #[test]
+    fn resuming_is_not_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        write_valid_loss_log(dir.path(), 1, &[(1.0, 4)]);
+
+        refuse_to_merge_runs(dir.path(), Some(1)).unwrap();
+    }
+
+    /// And the ordinary case stays ordinary: a directory that does not exist, is
+    /// empty, or holds only a previous run's `config.json` is not a merge.
+    #[test]
+    fn a_directory_without_epoch_logs_is_not_a_used_run() {
+        let dir = tempfile::tempdir().unwrap();
+        refuse_to_merge_runs(&dir.path().join("does-not-exist"), None).unwrap();
+        refuse_to_merge_runs(dir.path(), None).unwrap();
+
+        std::fs::write(dir.path().join("config.json"), "{}").unwrap();
+        std::fs::create_dir_all(dir.path().join("checkpoint")).unwrap();
+        refuse_to_merge_runs(dir.path(), None).unwrap();
     }
 
     /// Collects the ids of the 2-D float parameters, so a gradient can be looked
