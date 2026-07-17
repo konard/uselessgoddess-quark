@@ -65,10 +65,15 @@ spending sharing's savings on **width** does not pay for the loss of **layer
 diversity**.* That is a real result, and per §4 it appears to be untested in the
 literature.
 
-**And it points the opposite way from the recent literature.** Saunshi et al.
-(ICLR 2025) find looping *improves* perplexity at iso-parameter. run1-vs-run2
-suggests the reverse. Both can be true — they are different comparisons — which
-is precisely why the clean experiment is worth running.
+**It does *not* contradict the recent literature, and an earlier draft of this
+section was wrong to imply it might.** Saunshi et al. (arXiv:2502.17416, ICLR
+2025) find looping improves perplexity **at iso-parameter** — a looped model
+beats a *dense model of the same stored size*. run1-vs-run2 is not that
+comparison, and neither is anything else here. Contradicting Saunshi would take
+`quark_3m` against a genuinely dense 2.87M model; no such run exists.
+
+The comparison this project *can* make is iso-**FLOP**, and issue #6 has now
+made it: see §3 and §10. It came out in Saunshi's direction, not against it.
 
 **run2 vs run3 is confounded by the LR schedule.** DERIVED, by reconstructing the
 schedule and validating it to 10 significant figures against the logged LRs:
@@ -399,11 +404,12 @@ model in Rust" — that is engineering, not a claim.
 It is: **what does weight sharing actually buy at the 3–30M scale, when you spend
 the savings?**
 
-- Two of the three points already exist (run1, run2).
-- The third is one config away and costs one hour (`quark_22m`).
+- All three points now exist: run1, run2, and `quark_22m` (issue #6, §10).
 - The comparison run1-vs-run2 makes — *re-widening a looped model to restore
   parameter parity* — appears **untested in the literature**.
-- It points **against** Saunshi et al. (ICLR 2025), at a scale nobody tested.
+- The `quark_22m`-vs-run1 comparison is iso-FLOP and **agrees** with Saunshi et
+  al. (arXiv:2502.17416, ICLR 2025) in direction, at a scale they did not test.
+  The iso-*parameter* claim they actually make remains untested here.
 - The identity in §3 is a clean, checkable, general result that the field
   routinely gets wrong: *sharing optimizes the resource that was never scarce.*
 
