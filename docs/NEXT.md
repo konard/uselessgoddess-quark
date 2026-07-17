@@ -173,6 +173,15 @@ and it will silently scale the wrong way the moment `grad_accum` changes. Which
 §3 just recommended changing. Fix the unit before the sweep, or the sweep
 measures the warmup as much as the LR.
 
+DONE: `TrainConfig` now carries `warmup_ratio: Option<f64>`. When set, the warmup
+is that fraction of `total_batches` — a fixed *share* of the run, so it no longer
+drifts when the epoch count or the `batch_size`/`grad_accum` split changes (the
+three things the sweep varies). `None` is the default and reproduces the old
+absolute `warmup_batches` behaviour exactly, so the reference run is untouched;
+the sweep configs set `warmup_ratio` so every run warms over the same share.
+`effective_warmup_batches()` resolves the two, and it is what both the scheduler
+and the run-length guard read. See `src/train/mod.rs` and its scheduler tests.
+
 ---
 
 ## 4. Model size: keep 22M, and lift the rank cap instead
@@ -688,8 +697,9 @@ selection with the guard removed.
 Each step is gated on the one before it, and the ordering is the point — §1 says
 the exotic stuff is second-order.
 
-1. **Fix the warmup unit** (§3). Cheap, and everything downstream is an LR-adjacent
-   sweep that the current unit quietly corrupts.
+1. **Fix the warmup unit** (§3). ✅ DONE — `warmup_ratio` lands the run-relative
+   unit without touching the reference run; everything downstream is an LR-adjacent
+   sweep that the old absolute unit quietly corrupted.
 2. **4 epochs + dropout 0.1, wd swept {0.1, 0.5, 1.0, 2.0}** (§2). ~4 GPU-hours.
    The only recommendation here fitted at quark's scale, and the largest expected
    win. *Everything below is noise until this runs.*

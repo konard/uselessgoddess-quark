@@ -83,8 +83,26 @@ pub struct TrainConfig {
     /// Cosine floor, as a fraction of [`Self::lr`].
     pub min_lr_ratio: f64,
     /// Warmup length **in batches, not optimizer steps** -- see
-    /// [`Self::total_batches`].
+    /// [`Self::total_batches`]. Ignored when [`Self::warmup_ratio`] is set.
     pub warmup_batches: usize,
+    /// Warmup length as a *fraction of the whole run*, resolved against
+    /// [`Self::total_batches`]. When set, it overrides [`Self::warmup_batches`].
+    ///
+    /// [`Self::warmup_batches`] is an absolute count, and so is a *different
+    /// fraction* of every run: `200` is 1.2% of the 1-epoch reference but 0.3%
+    /// of a 4-epoch sweep, and it shrinks again whenever `grad_accumulation`
+    /// rises to hold a larger effective batch (docs/NEXT.md §3, §13). That drift
+    /// is silent -- nothing recomputes the warmup when the run's shape changes --
+    /// so two runs meant to be comparable warm the learning rate for different
+    /// shares of training. A ratio pins the share instead: `Some(0.02)` warms
+    /// over the first 2% of the schedule no matter how many epochs it runs or how
+    /// the effective batch is split between `batch_size` and `grad_accumulation`.
+    ///
+    /// `#[serde(default)]` keeps configs written before this field loadable, and
+    /// `None` reproduces the previous behaviour exactly -- the absolute
+    /// `warmup_batches` count, unchanged -- so the reference run is untouched.
+    #[serde(default)]
+    pub warmup_ratio: Option<f64>,
 
     pub weight_decay: f32,
     pub beta_1: f32,
@@ -163,6 +181,10 @@ impl Default for TrainConfig {
             // al. 2022 §3.
             min_lr_ratio: 0.1,
             warmup_batches: 200,
+            // Absolute count by default: `None` keeps the reference run's
+            // schedule byte-for-byte. Set `warmup_ratio` instead when a run
+            // changes epochs or the batch split and the warmup should follow.
+            warmup_ratio: None,
 
             // burn's AdamW defaults are epsilon 1e-5 and weight_decay 1e-4;
             // neither is a language-modelling default. 1e-5 is large enough to
@@ -226,6 +248,27 @@ impl TrainConfig {
         self.num_epochs * self.batches_per_epoch(dataset_len)
     }
 
+    /// Warmup length in batches for a run of `total_batches`, resolving
+    /// [`Self::warmup_ratio`] against it.
+    ///
+    /// With a ratio set, the warmup is a fixed share of the whole schedule --
+    /// grad-accumulation- and epoch-invariant, since `total_batches` already
+    /// folds both in. Rounded to the nearest batch, and never longer than the
+    /// run: a `ratio >= 1.0` would leave no batches for the cosine decay, so it
+    /// is clamped to `total_batches - 1` (the training-loop guard rejects the
+    /// pathological case up front; this keeps the schedule well-formed for the
+    /// callers, e.g. tests, that build it directly). With no ratio, the absolute
+    /// [`Self::warmup_batches`] is returned unchanged.
+    pub fn effective_warmup_batches(&self, total_batches: usize) -> usize {
+        match self.warmup_ratio {
+            Some(ratio) => {
+                let batches = (ratio * total_batches as f64).round() as usize;
+                batches.min(total_batches.saturating_sub(1))
+            }
+            None => self.warmup_batches,
+        }
+    }
+
     pub fn min_lr(&self) -> f64 {
         self.lr * self.min_lr_ratio
     }
@@ -264,6 +307,18 @@ impl TrainConfig {
                 "min_lr_ratio must be in [0, 1], got {}",
                 self.min_lr_ratio
             ));
+        }
+        // A ratio in [0, 1): 0 disables warmup, but 1.0 would spend the whole
+        // run ramping and leave nothing for the cosine leg. The run-length guard
+        // in `train` catches the derived count against the real dataset; this
+        // catches a nonsense ratio before any data is loaded.
+        if let Some(ratio) = self.warmup_ratio {
+            if !(ratio.is_finite() && (0.0..1.0).contains(&ratio)) {
+                errs.push(format!(
+                    "warmup_ratio must be in [0, 1) when set (null falls back to \
+                     warmup_batches), got {ratio}"
+                ));
+            }
         }
         if self.weight_decay < 0.0 {
             errs.push("weight_decay must not be negative".to_string());
@@ -485,7 +540,12 @@ fn lr_scheduler_config(config: &TrainConfig, total_batches: usize) -> ComposedLr
 
     let composed = ComposedLrSchedulerConfig::new().cosine(cosine);
 
-    if config.warmup_batches == 0 {
+    // Resolve `warmup_ratio` (if set) against the run length here, so every
+    // caller -- the training loop and the schedule tests alike -- sees the same
+    // warmup and the ratio is the single source of truth.
+    let warmup_batches = config.effective_warmup_batches(total_batches);
+
+    if warmup_batches == 0 {
         // `LinearLrSchedulerConfig::init` rejects num_iters == 0, so a
         // zero-length warmup has to be an absent leg rather than an empty one.
         return composed;
@@ -493,12 +553,8 @@ fn lr_scheduler_config(config: &TrainConfig, total_batches: usize) -> ComposedLr
 
     // The ramp must start above zero (burn requires initial_lr > 0); one
     // warmup-batch's worth of the ramp is the natural first rung.
-    let start = 1.0 / config.warmup_batches as f64;
-    composed.linear(LinearLrSchedulerConfig::new(
-        start,
-        1.0,
-        config.warmup_batches,
-    ))
+    let start = 1.0 / warmup_batches as f64;
+    composed.linear(LinearLrSchedulerConfig::new(start, 1.0, warmup_batches))
 }
 
 /// The name burn's `LossMetric` logs under, and the name its default
@@ -673,10 +729,13 @@ pub fn run<B: AutodiffBackend>(
 
     let batches_per_epoch = config.batches_per_epoch(train_dataset.len());
     let total_batches = config.total_batches(train_dataset.len());
-    if config.warmup_batches >= total_batches {
+    let warmup_batches = config.effective_warmup_batches(total_batches);
+    if warmup_batches >= total_batches {
         bail!(
-            "warmup_batches {} must be less than the {total_batches} batches this run will \
-             perform, or the learning rate never reaches its peak",
+            "warmup of {warmup_batches} batches must be less than the {total_batches} batches this \
+             run will perform, or the learning rate never reaches its peak (warmup_ratio {:?}, \
+             warmup_batches {})",
+            config.warmup_ratio,
             config.warmup_batches
         );
     }
@@ -1384,6 +1443,103 @@ mod tests {
         };
         let mut s = lr_scheduler_config(&c, 10).init().unwrap();
         assert!((LrScheduler::step(&mut s) - c.lr).abs() < 1e-12);
+    }
+
+    /// The default, and every config written before `warmup_ratio` existed, must
+    /// resolve to the absolute count -- unchanged behaviour, so the reference run
+    /// is untouched. The serde half checks a config missing the field loads as
+    /// `None` rather than failing.
+    #[test]
+    fn an_absent_warmup_ratio_keeps_the_absolute_count() {
+        let c = TrainConfig::default();
+        assert!(c.warmup_ratio.is_none());
+        assert_eq!(c.effective_warmup_batches(10_000), c.warmup_batches);
+
+        let mut v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        v.as_object_mut().unwrap().remove("warmup_ratio");
+        let back: TrainConfig = serde_json::from_value(v).unwrap();
+        assert!(back.warmup_ratio.is_none());
+        assert_eq!(back, c);
+    }
+
+    /// A ratio is just a run-relative way to name a batch count: 0.1 of a
+    /// 100-batch run must drive the schedule identically to `warmup_batches = 10`,
+    /// and it overrides the absolute field even when that field is nonsense.
+    #[test]
+    fn warmup_ratio_drives_the_schedule_like_the_equivalent_count() {
+        let by_ratio = TrainConfig {
+            lr: 1e-3,
+            warmup_ratio: Some(0.1),
+            warmup_batches: 999, // deliberately absurd; the ratio must win
+            ..Default::default()
+        };
+        let by_count = TrainConfig {
+            lr: 1e-3,
+            warmup_batches: 10,
+            ..Default::default()
+        };
+        let total = 100;
+        assert_eq!(by_ratio.effective_warmup_batches(total), 10);
+
+        let mut a = lr_scheduler_config(&by_ratio, total).init().unwrap();
+        let mut b = lr_scheduler_config(&by_count, total).init().unwrap();
+        for i in 0..total {
+            let (x, y) = (LrScheduler::step(&mut a), LrScheduler::step(&mut b));
+            assert!((x - y).abs() < 1e-12, "batch {i}: ratio {x} vs count {y}");
+        }
+    }
+
+    /// The point of the ratio: it is the same *share* of every run, so it does
+    /// not drift when the run's shape changes. Quadrupling the epochs quadruples
+    /// the warmup batches (an absolute count would have stayed put and become a
+    /// quarter of the share), and `grad_accumulation` -- which never enters
+    /// `total_batches` -- never moves it.
+    #[test]
+    fn warmup_ratio_holds_its_share_across_epochs_and_grad_accumulation() {
+        let n = 1000; // 100 batches/epoch at batch_size 10
+        let short = TrainConfig {
+            batch_size: 10,
+            num_epochs: 1,
+            warmup_ratio: Some(0.05),
+            ..Default::default()
+        };
+        let long = TrainConfig {
+            num_epochs: 4,
+            ..short.clone()
+        };
+        assert_eq!(short.total_batches(n), 100);
+        assert_eq!(long.total_batches(n), 400);
+        assert_eq!(short.effective_warmup_batches(short.total_batches(n)), 5);
+        assert_eq!(long.effective_warmup_batches(long.total_batches(n)), 20);
+
+        let more_accum = TrainConfig {
+            grad_accumulation: 8,
+            ..short.clone()
+        };
+        assert_eq!(
+            more_accum.effective_warmup_batches(more_accum.total_batches(n)),
+            5,
+            "grad_accumulation is absent from total_batches, so it cannot move the warmup"
+        );
+    }
+
+    /// The range check fires before any data is touched: a ratio at or above 1.0
+    /// would leave no room for the cosine decay, and a non-finite one is nonsense.
+    #[test]
+    fn validate_rejects_a_warmup_ratio_outside_the_unit_interval() {
+        let ok = TrainConfig {
+            warmup_ratio: Some(0.02),
+            ..Default::default()
+        };
+        assert!(ok.validate().is_ok());
+        for bad in [Some(1.0), Some(-0.1), Some(f64::NAN), Some(f64::INFINITY)] {
+            let c = TrainConfig {
+                warmup_ratio: bad,
+                ..Default::default()
+            };
+            assert!(c.validate().is_err(), "ratio {bad:?} should be rejected");
+        }
     }
 
     /// The training step must produce a gradient for every parameter. A dangling

@@ -1,0 +1,101 @@
+name: GPU experiments
+
+# The one job in this repository that needs a GPU. It runs on the maintainer's
+# self-hosted runner and does the work a
+# hosted runner cannot: benchmark the backends against each other and train the
+# quark_22m sweep on real WikiText-103. Everything it produces -- the rendered
+# report, results.json, per-run logs -- is uploaded as an artifact, so the
+# outcome is reviewable without access to the runner.
+#
+# It is `workflow_dispatch` only. Nothing here should fire on a push: a sweep is
+# hours of GPU time and a deliberate act, not a side effect of committing.
+
+on:
+  workflow_dispatch:
+    inputs:
+      experiment-set:
+        description: "Which experiments to run (NEXT.md §13 order)"
+        type: choice
+        default: quick
+        options: [quick, sweep, extra, all]
+      train-backend:
+        description: "Backend to train and evaluate on"
+        type: choice
+        default: wgpu
+        options: [wgpu, vulkan, rocm, cuda]
+      bench-backends:
+        description: "Space-separated backends to benchmark against each other"
+        type: string
+        default: "wgpu vulkan"
+      time-budget-hours:
+        description: "Soft cap on the experiment loop; the issue allows ~8h"
+        type: string
+        default: "6"
+      data-dir:
+        description: "Folder holding wiki.{train,valid,test}.tokens and blimp/ (blank = auto-locate _work/)"
+        type: string
+        default: ""
+
+env:
+  CARGO_TERM_COLOR: always
+
+# One sweep at a time on the single physical GPU. Unlike CI, do NOT cancel the
+# in-flight run: an interrupted 6-hour sweep wastes far more than it saves, and
+# the results already written would be lost.
+concurrency:
+  group: gpu-experiments
+  cancel-in-progress: false
+
+jobs:
+  experiments:
+    name: benchmark + sweep (${{ inputs.experiment-set }} on ${{ inputs.train-backend }})
+    # The maintainer's runner is reached by its LABEL, which is `self-hosted`.
+    # `gpu` is the runner's *name*, not a label, so `[self-hosted, gpu]` matched
+    # nothing ("There are currently no running jobs" / "Add runs-on: self-hosted").
+    # See issue #8 discussion on PR #9.
+    runs-on: self-hosted
+    # A generous ceiling over the 8h the issue allows, so a run that overshoots
+    # its soft time budget is still stopped rather than pinning the GPU forever.
+    timeout-minutes: 600
+    steps:
+      - uses: actions/checkout@v4
+
+      # No rust-cache action here: it targets the hosted-runner cache and would
+      # fight the self-hosted runner's own persistent ~/.cargo and target/. The
+      # first backend build is ~12 min from cold; every later one reuses target/.
+      - name: Toolchain versions
+        run: |
+          rustc --version
+          cargo --version
+          python3 --version
+
+      # report.py renders the figures with matplotlib; collect.py is stdlib-only.
+      # Best-effort so a runner that already has it (or has no network) is not
+      # blocked -- the render step degrades to a warning if the import is still
+      # missing, and results.json is produced either way.
+      - name: Ensure Python deps for the report
+        run: python3 -m pip install --user --upgrade matplotlib || true
+
+      - name: Run experiments
+        env:
+          EXPERIMENT_SET: ${{ inputs.experiment-set }}
+          TRAIN_BACKEND: ${{ inputs.train-backend }}
+          BENCH_BACKENDS: ${{ inputs.bench-backends }}
+          TIME_BUDGET_HOURS: ${{ inputs.time-budget-hours }}
+          QUARK_DATA_DIR: ${{ inputs.data-dir }}
+        run: ./experiments/gpu/run_experiments.sh
+
+      # Uploaded even on failure: a sweep that dies halfway still produced the
+      # runs that finished, and the logs are how the failure gets diagnosed
+      # without shelling into the runner.
+      - name: Upload report and raw results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-experiments-${{ inputs.experiment-set }}-${{ inputs.train-backend }}
+          path: |
+            docs/report/
+            experiments/gpu/results.json
+            experiments/gpu/results/
+            experiments/gpu/configs/
+          if-no-files-found: warn
