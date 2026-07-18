@@ -11,6 +11,7 @@
 //!   per byte and word-level perplexity, both tokenizer-independent, and it
 //!   evaluates the GPT-2 baseline with the same code path.
 
+pub mod compress;
 pub mod config;
 pub mod data;
 pub mod eval;

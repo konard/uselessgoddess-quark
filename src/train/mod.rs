@@ -30,7 +30,7 @@ use burn::{
         composed::ComposedLrSchedulerConfig, cosine::CosineAnnealingLrSchedulerConfig,
         linear::LinearLrSchedulerConfig,
     },
-    module::{Module, ModuleVisitor, Param},
+    module::{AutodiffModule, Module, ModuleVisitor, Param},
     optim::AdamWConfig,
     prelude::Backend,
     record::{CompactRecorder, FileRecorder},
@@ -434,36 +434,42 @@ impl<B: AutodiffBackend> ModuleVisitor<B> for GradSumSquares<'_, B> {
     }
 }
 
-impl<B: AutodiffBackend> QuarkLm<B> {
-    /// RMS of this step's gradient over every parameter, as a device scalar.
-    ///
-    /// `unscale` undoes the `grad_accumulation` division that
-    /// [`TrainStep::step`] applies before `backward`, so the number reported is
-    /// the RMS of the gradient of the *unscaled* objective. That is the
-    /// interpretable one: with `grad_accumulation = 1` it is exactly what the
-    /// optimizer receives, and above 1 it approximates it, since the accumulated
-    /// sum of `N` micro-gradients each divided by `N` is their mean. The
-    /// approximation is only loose to the extent that micro-batch gradients
-    /// disagree with each other.
-    fn grad_rms(&self, grads: &B::Gradients, unscale: f64) -> Option<Tensor<B, 1>> {
-        let mut visitor = GradSumSquares::<B> {
-            grads,
-            sum_sq: None,
-            numel: 0,
-        };
-        self.visit(&mut visitor);
+/// RMS of one step's gradient over every parameter of `module`, as a device
+/// scalar.
+///
+/// `unscale` undoes the `grad_accumulation` division that [`TrainStep::step`]
+/// applies before `backward`, so the number reported is the RMS of the gradient
+/// of the *unscaled* objective. That is the interpretable one: with
+/// `grad_accumulation = 1` it is exactly what the optimizer receives, and above
+/// 1 it approximates it, since the accumulated sum of `N` micro-gradients each
+/// divided by `N` is their mean. The approximation is only loose to the extent
+/// that micro-batch gradients disagree with each other.
+///
+/// Generic over the module rather than an inherent method on [`QuarkLm`],
+/// because [`Compressor`](crate::compress::Compressor) reports the same metric
+/// and the visitor above never looked at anything model-specific.
+pub(crate) fn grad_rms<B: AutodiffBackend, M: AutodiffModule<B>>(
+    module: &M,
+    grads: &B::Gradients,
+    unscale: f64,
+) -> Option<Tensor<B, 1>> {
+    let mut visitor = GradSumSquares::<B> {
+        grads,
+        sum_sq: None,
+        numel: 0,
+    };
+    module.visit(&mut visitor);
 
-        let sum_sq = visitor.sum_sq?;
-        debug_assert!(
-            visitor.numel > 0,
-            "a gradient exists but covers no elements"
-        );
-        let rms = sum_sq.div_scalar(visitor.numel as f64).sqrt();
-        // Back to the autodiff backend, which is what `LmOutput<B>` holds. The
-        // value is a measurement, not part of any graph -- nothing differentiates
-        // it, and `from_inner` attaches no history.
-        Some(Tensor::from_inner(rms.mul_scalar(unscale)))
-    }
+    let sum_sq = visitor.sum_sq?;
+    debug_assert!(
+        visitor.numel > 0,
+        "a gradient exists but covers no elements"
+    );
+    let rms = sum_sq.div_scalar(visitor.numel as f64).sqrt();
+    // Back to the autodiff backend, which is what `LmOutput<B>` holds. The
+    // value is a measurement, not part of any graph -- nothing differentiates
+    // it, and `from_inner` attaches no history.
+    Some(Tensor::from_inner(rms.mul_scalar(unscale)))
 }
 
 impl<B: AutodiffBackend> TrainStep for QuarkLm<B> {
@@ -504,7 +510,7 @@ impl<B: AutodiffBackend> TrainStep for QuarkLm<B> {
 
         // Measured from the same gradients the optimizer is about to receive,
         // and before `TrainOutput::new` consumes them.
-        item.grad_rms = self.grad_rms(&grads, self.grad_accumulation() as f64);
+        item.grad_rms = grad_rms(self, &grads, self.grad_accumulation() as f64);
 
         TrainOutput::new(self, grads, item)
     }
@@ -700,7 +706,10 @@ fn recorded_epochs(artifact_dir: &Path) -> Option<usize> {
 /// the `quark_3m_dense` numbers from the run before it (`docs/RESULTS.md` §5).
 /// It loaded the right checkpoint only because its single epoch happened to beat
 /// every stale one. That is luck, and luck is not a mechanism.
-fn refuse_to_merge_runs(artifact_dir: &Path, resume_from_epoch: Option<usize>) -> Result<()> {
+pub(crate) fn refuse_to_merge_runs(
+    artifact_dir: &Path,
+    resume_from_epoch: Option<usize>,
+) -> Result<()> {
     // Resuming *wants* the previous run's logs: they are the same run.
     if resume_from_epoch.is_some() {
         return Ok(());
@@ -719,19 +728,18 @@ fn refuse_to_merge_runs(artifact_dir: &Path, resume_from_epoch: Option<usize>) -
     Ok(())
 }
 
-/// Train, and return the best model by validation loss.
+/// The two shards a run reads, opened, vocabulary-checked and cut into windows,
+/// plus the end-of-text id they were written with.
 ///
-/// Deliberately generic over the backend rather than hardcoding one: the issue
-/// asks for wgpu as the primary backend, but the tests run this same function on
-/// ndarray. A harness that only compiles against the GPU is a harness that only
-/// gets tested by the person who has the GPU.
-pub fn run<B: AutodiffBackend>(
-    config: TrainConfig,
-    device: B::Device,
-) -> Result<QuarkLm<B::InnerBackend>> {
-    config.validate()?;
-    refuse_to_merge_runs(&config.artifact_dir, config.resume_from_epoch)?;
-
+/// Split out of [`run`] so that a second training entry point -- the compressor
+/// in [`crate::compress`] -- reaches the same shard handling instead of a second
+/// copy of it. Nothing here is model-specific: a window is `seq_len` contiguous
+/// tokens whatever consumes it.
+///
+/// The `eos_id` is returned because the compressor's decoder needs a
+/// sequence-start token and the tokenizer has no dedicated one; the language
+/// model has no use for it and ignores it.
+pub(crate) fn open_datasets(config: &TrainConfig) -> Result<(TokenDataset, TokenDataset, u32)> {
     let train_shard = Arc::new(
         Shard::open(&config.train_shard)
             .with_context(|| format!("opening train shard {}", config.train_shard.display()))?,
@@ -754,6 +762,7 @@ pub fn run<B: AutodiffBackend>(
         }
     }
 
+    let eos_id = train_shard.meta().eos_id;
     let train_dataset = TokenDataset::train(train_shard, config.seq_len);
     let valid_dataset = TokenDataset::train(valid_shard, config.seq_len);
     if train_dataset.len() == 0 {
@@ -769,6 +778,69 @@ pub fn run<B: AutodiffBackend>(
         );
     }
 
+    Ok((train_dataset, valid_dataset, eos_id))
+}
+
+/// Train, and return the best model by validation loss.
+///
+/// Deliberately generic over the backend rather than hardcoding one: the issue
+/// asks for wgpu as the primary backend, but the tests run this same function on
+/// ndarray. A harness that only compiles against the GPU is a harness that only
+/// gets tested by the person who has the GPU.
+pub fn run<B: AutodiffBackend>(
+    config: TrainConfig,
+    device: B::Device,
+) -> Result<QuarkLm<B::InnerBackend>> {
+    config.validate()?;
+    refuse_to_merge_runs(&config.artifact_dir, config.resume_from_epoch)?;
+
+    let (train_dataset, valid_dataset, _eos_id) = open_datasets(&config)?;
+
+    // Written before the first step, so an interrupted run is still reproducible.
+    config.save(&config.artifact_dir.join("config.json"))?;
+
+    launch(&config, &device, train_dataset, valid_dataset, |device| {
+        // The model has to be told the accumulation factor and the z-loss
+        // coefficient because burn implements `TrainStep` *for the model*, and
+        // hands `step` nothing but the batch. See `QuarkLm::grad_accumulation`.
+        QuarkLm::<B>::new(config.model.clone(), device)
+            .with_grad_accumulation(config.grad_accumulation)
+            .with_z_loss(config.z_loss)
+    })
+}
+
+/// Everything between "the data is ready" and "here is the best model": the
+/// schedule, the dataloaders, the optimizer, burn's learner, and the recovery of
+/// the best checkpoint afterwards.
+///
+/// Generic over the model rather than written twice. The compressor
+/// ([`crate::compress`]) is a different architecture with a different loss, but
+/// it consumes the same [`TokenBatch`] and reports the same [`LmOutput`], and
+/// every line below cares only about those two. Extracting this is what lets an
+/// optional feature reuse the run harness -- checkpoint pruning, best-epoch
+/// recovery, the metric set, the accumulation semantics -- instead of growing a
+/// parallel copy that drifts.
+///
+/// `build` is a closure, not a model, because the best-checkpoint recovery at
+/// the end needs a *second*, freshly-initialized model to load the record into.
+pub(crate) fn launch<B, M>(
+    config: &TrainConfig,
+    device: &B::Device,
+    train_dataset: TokenDataset,
+    valid_dataset: TokenDataset,
+    build: impl Fn(&B::Device) -> M,
+) -> Result<M::InnerModule>
+where
+    B: AutodiffBackend,
+    M: AutodiffModule<B>
+        + TrainStep<Input = TokenBatch<B>, Output = LmOutput<B>>
+        + core::fmt::Display
+        + Send
+        + 'static,
+    M::InnerModule: InferenceStep<Input = TokenBatch<B::InnerBackend>, Output = LmOutput<B::InnerBackend>>
+        + Send
+        + 'static,
+{
     let batches_per_epoch = config.batches_per_epoch(train_dataset.len());
     let total_batches = config.total_batches(train_dataset.len());
     let warmup_batches = config.effective_warmup_batches(total_batches);
@@ -788,12 +860,8 @@ pub fn run<B: AutodiffBackend>(
         batches_per_epoch,
         total_batches,
         tokens_per_optimizer_step = config.batch_size * config.seq_len * config.grad_accumulation,
-        params = config.model.param_count(),
         "starting training"
     );
-
-    // Written before the first step, so an interrupted run is still reproducible.
-    config.save(&config.artifact_dir.join("config.json"))?;
 
     let dataloader_train = DataLoaderBuilder::new(TokenBatcher)
         .batch_size(config.batch_size)
@@ -810,12 +878,7 @@ pub fn run<B: AutodiffBackend>(
         .set_device(device.clone())
         .build(valid_dataset);
 
-    // The model has to be told the accumulation factor and the z-loss
-    // coefficient because burn implements `TrainStep` *for the model*, and hands
-    // `step` nothing but the batch. See `QuarkLm::grad_accumulation`.
-    let model = QuarkLm::<B>::new(config.model.clone(), &device)
-        .with_grad_accumulation(config.grad_accumulation)
-        .with_z_loss(config.z_loss);
+    let model = build(device);
 
     let optimizer = AdamWConfig::new()
         .with_beta_1(config.beta_1)
@@ -825,7 +888,7 @@ pub fn run<B: AutodiffBackend>(
         .with_grad_clipping(Some(GradientClippingConfig::Norm(config.grad_clip_norm)))
         .init();
 
-    let lr_scheduler = lr_scheduler_config(&config, total_batches)
+    let lr_scheduler = lr_scheduler_config(config, total_batches)
         .init()
         .map_err(|e| anyhow::anyhow!("building the learning rate schedule: {e}"))?;
 
@@ -882,8 +945,9 @@ pub fn run<B: AutodiffBackend>(
                 .join("checkpoint")
                 .join(format!("model-{epoch}"));
 
-            let best = QuarkLm::<B::InnerBackend>::new(config.model.clone(), &device)
-                .load_file(path.clone(), &CompactRecorder::new(), &device)
+            let best = build(device)
+                .valid()
+                .load_file(path.clone(), &CompactRecorder::new(), device)
                 .with_context(|| {
                     format!(
                         "loading the best checkpoint (epoch {epoch}) from {}",

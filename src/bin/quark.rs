@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use quark::{
+    compress::{CompressConfig, CompressTrainConfig},
     data,
     eval::{EvalConfig, EvalRun, GenerationConfig},
     TrainConfig,
@@ -97,6 +98,41 @@ backend_entry!(train_cuda, "cuda", burn_cuda::Cuda);
 backend_entry!(train_vulkan, "vulkan", burn_wgpu::Vulkan);
 backend_entry!(train_rocm, "rocm", burn_rocm::Rocm);
 
+/// The same again, for the compressor.
+///
+/// A third macro rather than a generic one over the config type: the two differ
+/// only in the function they call, but making that a parameter would mean
+/// naming `quark::train::run` and `quark::compress::train::run` as paths in an
+/// expansion where the backend type is still just tokens, and the result reads
+/// worse than the repetition.
+macro_rules! compress_entry {
+    ($name:ident, $feature:literal, $backend:ty) => {
+        #[cfg(feature = $feature)]
+        fn $name(config: CompressTrainConfig) -> Result<()> {
+            quark::compress::train::run::<burn::backend::Autodiff<$backend>>(
+                config,
+                Default::default(),
+            )?;
+            Ok(())
+        }
+
+        #[cfg(not(feature = $feature))]
+        fn $name(_config: CompressTrainConfig) -> Result<()> {
+            bail!(
+                "this binary was built without the `{feature}` backend; rebuild with \
+                 `cargo build --release --features {feature}`",
+                feature = $feature,
+            )
+        }
+    };
+}
+
+compress_entry!(compress_ndarray, "ndarray", burn_ndarray::NdArray<f32>);
+compress_entry!(compress_wgpu, "wgpu", burn_wgpu::Wgpu);
+compress_entry!(compress_cuda, "cuda", burn_cuda::Cuda);
+compress_entry!(compress_vulkan, "vulkan", burn_wgpu::Vulkan);
+compress_entry!(compress_rocm, "rocm", burn_rocm::Rocm);
+
 /// The same, for evaluation.
 ///
 /// Note the absence of `Autodiff`: evaluation computes no gradients, and
@@ -125,6 +161,25 @@ eval_entry!(eval_wgpu, "wgpu", burn_wgpu::Wgpu);
 eval_entry!(eval_cuda, "cuda", burn_cuda::Cuda);
 eval_entry!(eval_vulkan, "vulkan", burn_wgpu::Vulkan);
 eval_entry!(eval_rocm, "rocm", burn_rocm::Rocm);
+
+/// Which built-in compressor `quark compress` starts from.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default, ValueEnum)]
+enum CompressPreset {
+    /// ~15M parameters, the one the design targets.
+    #[default]
+    Compressor15m,
+    /// A toy: 256-token vocabulary, two layers. For smoke tests on ndarray.
+    Tiny,
+}
+
+impl CompressPreset {
+    fn config(self) -> CompressConfig {
+        match self {
+            Self::Compressor15m => CompressConfig::compressor_15m(),
+            Self::Tiny => CompressConfig::tiny(),
+        }
+    }
+}
 
 #[derive(Subcommand)]
 enum Command {
@@ -192,6 +247,56 @@ enum Command {
         resume_from_epoch: Option<usize>,
         /// Print the resolved config and the parameter budget, then exit without
         /// touching the GPU.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Train the optional text compressor on prepared shards.
+    ///
+    /// Same shards, same windows, same schedule as `train` -- see
+    /// `docs/COMPRESSION.md`. The objective is reconstruction of the span, so
+    /// there is no perplexity here and no `--seq-len`: the window *is* the span,
+    /// and it comes from `--span-len`.
+    Compress {
+        /// A `CompressTrainConfig` JSON, as written to
+        /// `<artifact-dir>/config.json` by a previous run. Omit for `--preset`.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// The built-in compressor to start from, when `--config` is absent.
+        #[arg(long, value_enum, default_value_t = CompressPreset::Compressor15m)]
+        preset: CompressPreset,
+        #[arg(long, value_enum)]
+        backend: Option<BackendChoice>,
+
+        // Shape. Both of these change the compression ratio, which is why they
+        // are worth a flag: `--span-len 512 --n-slots 64` is 8x, and reporting
+        // what that costs is the whole experiment.
+        #[arg(long)]
+        span_len: Option<usize>,
+        #[arg(long)]
+        n_slots: Option<usize>,
+
+        // Run. The same subset as `train`, minus `--seq-len`, which is
+        // `--span-len` here and would otherwise be two names for one number.
+        #[arg(long)]
+        train_shard: Option<PathBuf>,
+        #[arg(long)]
+        valid_shard: Option<PathBuf>,
+        #[arg(long)]
+        artifact_dir: Option<PathBuf>,
+        #[arg(long)]
+        batch_size: Option<usize>,
+        #[arg(long)]
+        grad_accumulation: Option<usize>,
+        #[arg(long)]
+        num_epochs: Option<usize>,
+        #[arg(long)]
+        lr: Option<f64>,
+        #[arg(long)]
+        seed: Option<u64>,
+        #[arg(long)]
+        resume_from_epoch: Option<usize>,
+        /// Print the resolved config, the parameter budget and the rate, then
+        /// exit without touching the GPU.
         #[arg(long)]
         dry_run: bool,
     },
@@ -348,6 +453,78 @@ fn main() -> Result<()> {
                 BackendChoice::Cuda => train_cuda(cfg)?,
                 BackendChoice::Vulkan => train_vulkan(cfg)?,
                 BackendChoice::Rocm => train_rocm(cfg)?,
+            }
+        }
+        Command::Compress {
+            config,
+            preset,
+            backend,
+            span_len,
+            n_slots,
+            train_shard,
+            valid_shard,
+            artifact_dir,
+            batch_size,
+            grad_accumulation,
+            num_epochs,
+            lr,
+            seed,
+            resume_from_epoch,
+            dry_run,
+        } => {
+            let cfg = match &config {
+                Some(path) => CompressTrainConfig::load(path)
+                    .with_context(|| format!("reading config {}", path.display()))?,
+                None => CompressTrainConfig {
+                    compress: preset.config(),
+                    ..CompressTrainConfig::default()
+                },
+            };
+            let (mut compress, mut train) = (cfg.compress, cfg.train);
+
+            macro_rules! set {
+                ($target:ident: $($field:ident),* $(,)?) => {
+                    $( if let Some(v) = $field { $target.$field = v; } )*
+                };
+            }
+            set!(compress: span_len, n_slots);
+            set!(train:
+                train_shard,
+                valid_shard,
+                artifact_dir,
+                batch_size,
+                grad_accumulation,
+                num_epochs,
+                lr,
+                seed,
+            );
+            if resume_from_epoch.is_some() {
+                train.resume_from_epoch = resume_from_epoch;
+            }
+
+            // Re-paired rather than assembled: `--span-len` has just moved a
+            // number the run also holds, and `sync` is the only place that knows
+            // to carry it across. Building the struct directly here would let a
+            // flag desynchronise the two halves, which `validate` would then
+            // reject -- correctly, but for a reason the user did not cause.
+            let cfg = CompressTrainConfig::sync(compress, train);
+            cfg.validate()?;
+
+            let backend = backend.unwrap_or_default();
+            if dry_run {
+                println!("{}", cfg.compress.budget_table());
+                println!("{}", serde_json::to_string_pretty(&cfg)?);
+                println!("backend: {backend:?}");
+                return Ok(());
+            }
+
+            tracing::info!(?backend, "starting compressor training");
+            match backend {
+                BackendChoice::Ndarray => compress_ndarray(cfg)?,
+                BackendChoice::Wgpu => compress_wgpu(cfg)?,
+                BackendChoice::Cuda => compress_cuda(cfg)?,
+                BackendChoice::Vulkan => compress_vulkan(cfg)?,
+                BackendChoice::Rocm => compress_rocm(cfg)?,
             }
         }
         Command::Eval {
