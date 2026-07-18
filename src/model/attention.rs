@@ -26,6 +26,29 @@ use burn::{
     tensor::{activation::softmax, Tensor},
 };
 
+/// Which positions a query is allowed to read.
+///
+/// The parameters are identical either way -- this selects a mask, not a
+/// module -- so a stack can be built once and run in whichever direction its
+/// role needs. That is the entire reason this is a `forward` argument rather
+/// than a config field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Attend {
+    /// Query `i` reads keys `0..=i`. What a language model needs, and what
+    /// every call in this crate did before this enum existed.
+    #[default]
+    Causal,
+    /// Every query reads every key. What an *encoder* needs: a compressor's
+    /// encoder is not predicting anything, it is summarizing a span it has
+    /// entirely in hand, and forbidding it to look right would throw that away
+    /// for nothing.
+    ///
+    /// Meaningless with a [`KvCache`], which exists to serve left-to-right
+    /// decoding; [`GroupedQueryAttention::forward_cached`] is causal-only and
+    /// says so.
+    Bidirectional,
+}
+
 /// Cached keys and values for incremental decoding.
 ///
 /// Holds `[batch, n_kv_heads, seq_so_far, d_head]` with RoPE already applied,
@@ -158,14 +181,24 @@ impl<B: Backend> GroupedQueryAttention<B> {
     /// Training forward: full causal self-attention over `[batch, seq,
     /// d_model]`.
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
-        self.forward_inner(x, None, 0)
+        self.forward_inner(x, None, 0, Attend::Causal)
+    }
+
+    /// Self-attention under an explicit [`Attend`] mode.
+    ///
+    /// `forward_as(x, Attend::Causal)` is [`Self::forward`], bit for bit.
+    pub fn forward_as(&self, x: Tensor<B, 3>, attend: Attend) -> Tensor<B, 3> {
+        self.forward_inner(x, None, 0, attend)
     }
 
     /// Incremental forward for decoding. `x` is usually a single token; the
     /// cache is extended in place.
+    ///
+    /// Causal by construction: a cache holds only the past, so there is no
+    /// bidirectional reading of it to offer.
     pub fn forward_cached(&self, x: Tensor<B, 3>, cache: &mut KvCache<B>) -> Tensor<B, 3> {
         let pos = cache.len();
-        self.forward_inner(x, Some(cache), pos)
+        self.forward_inner(x, Some(cache), pos, Attend::Causal)
     }
 
     fn forward_inner(
@@ -173,6 +206,7 @@ impl<B: Backend> GroupedQueryAttention<B> {
         x: Tensor<B, 3>,
         cache: Option<&mut KvCache<B>>,
         pos_offset: usize,
+        attend: Attend,
     ) -> Tensor<B, 3> {
         let [batch, seq, _] = x.dims();
 
@@ -243,14 +277,24 @@ impl<B: Backend> GroupedQueryAttention<B> {
         // visible; its last row is entirely true, so softmax over an all -inf row
         // yields NaN. burn's own `generate_autoregressive_mask` likewise uses
         // `tril_mask(.., 0)`.
-        let mask = Tensor::<B, 2, burn::tensor::Bool>::tril_mask(
-            [seq, kv_seq],
-            pos_offset as i64,
-            &scores.device(),
-        )
-        .unsqueeze::<4>()
-        .expand([batch, self.n_heads, seq, kv_seq]);
-        let scores = scores.mask_fill(mask, f32::NEG_INFINITY);
+        //
+        // Under `Attend::Bidirectional` there is no mask at all -- not an
+        // all-visible one. Spans reaching this path are dense fixed-length
+        // windows out of a token shard, so there is no padding to hide, and an
+        // unmasked softmax is both cheaper and impossible to get off by one.
+        let scores = match attend {
+            Attend::Causal => {
+                let mask = Tensor::<B, 2, burn::tensor::Bool>::tril_mask(
+                    [seq, kv_seq],
+                    pos_offset as i64,
+                    &scores.device(),
+                )
+                .unsqueeze::<4>()
+                .expand([batch, self.n_heads, seq, kv_seq]);
+                scores.mask_fill(mask, f32::NEG_INFINITY)
+            }
+            Attend::Bidirectional => scores,
+        };
 
         let weights = self.dropout.forward(softmax(scores, 3));
 
@@ -346,6 +390,64 @@ mod tests {
         let lb = after.slice([0..1, seq - 1..seq, 0..32]);
         let delta: f32 = (la - lb).abs().sum().into_scalar();
         assert!(delta > 1e-3, "perturbation had no effect; test is vacuous");
+    }
+
+    /// The guarantee that makes [`Attend`] a safe addition rather than a
+    /// rewrite: the mode that every existing caller takes has to be the mode
+    /// they already had. Bit-exact, not approximately -- `forward` and
+    /// `forward_as(.., Causal)` run the same branch, so any difference at all
+    /// would mean the refactor changed the arithmetic.
+    #[test]
+    fn the_causal_mode_is_exactly_what_forward_always_did() {
+        let d = device();
+        let attn = cfg(4, 2).init::<TestBackend>(&d);
+        let x = Tensor::<TestBackend, 3>::random([2, 7, 32], Distribution::Default, &d);
+
+        let want: Vec<f32> = attn.forward(x.clone()).into_data().to_vec().unwrap();
+        let got: Vec<f32> = attn
+            .forward_as(x, Attend::Causal)
+            .into_data()
+            .to_vec()
+            .unwrap();
+        assert_eq!(want, got);
+    }
+
+    /// The mirror image of `attention_is_causal`, and the property the encoder
+    /// is built on: under `Bidirectional` a perturbation at the *last* position
+    /// must reach *every* earlier position. If it does not, the mask was not
+    /// actually dropped and the encoder is a causal model wearing a new name --
+    /// which would show up only as a mysteriously weak compressor.
+    #[test]
+    fn bidirectional_attention_lets_every_position_see_the_last_one() {
+        let d = device();
+        let attn = cfg(4, 2).init::<TestBackend>(&d);
+        let seq = 6;
+
+        let x = Tensor::<TestBackend, 3>::random([1, seq, 32], Distribution::Default, &d);
+        let base = attn.forward_as(x.clone(), Attend::Bidirectional);
+
+        let noise = Tensor::<TestBackend, 3>::random([1, 1, 32], Distribution::Default, &d) * 100.0;
+        let perturbed = x.clone().slice_assign(
+            [0..1, seq - 1..seq, 0..32],
+            x.clone().slice([0..1, seq - 1..seq, 0..32]) + noise,
+        );
+        let after = attn.forward_as(perturbed, Attend::Bidirectional);
+
+        // Every position, including position 0, which under a causal mask can
+        // only ever see itself.
+        for t in 0..seq {
+            let delta: f32 = (base.clone().slice([0..1, t..t + 1, 0..32])
+                - after.clone().slice([0..1, t..t + 1, 0..32]))
+            .abs()
+            .sum()
+            .into_scalar();
+            assert!(
+                delta > 1e-3,
+                "position {t} did not see the perturbation at position {}; \
+                 the causal mask is still being applied",
+                seq - 1
+            );
+        }
     }
 
     /// Incremental decoding with a KV cache must reproduce the full forward

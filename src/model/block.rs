@@ -10,7 +10,7 @@ use burn::{
 use crate::{
     config::{ModelConfig, NormPlacement},
     model::{
-        attention::{GroupedQueryAttention, GroupedQueryAttentionConfig, KvCache},
+        attention::{Attend, GroupedQueryAttention, GroupedQueryAttentionConfig, KvCache},
         ffn::{SwiGluFeedForward, SwiGluFeedForwardConfig},
     },
 };
@@ -52,17 +52,31 @@ impl<B: Backend> Block<B> {
     }
 
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
-        self.forward_inner(x, None)
+        self.forward_inner(x, None, Attend::Causal)
+    }
+
+    /// The block under an explicit [`Attend`] mode.
+    ///
+    /// Only the attention mask changes; norms, FFN, residuals and parameter
+    /// count are identical. That is what lets an encoder and a decoder be the
+    /// same `Block` type built from the same [`ModelConfig`].
+    pub fn forward_as(&self, x: Tensor<B, 3>, attend: Attend) -> Tensor<B, 3> {
+        self.forward_inner(x, None, attend)
     }
 
     pub fn forward_cached(&self, x: Tensor<B, 3>, cache: &mut KvCache<B>) -> Tensor<B, 3> {
-        self.forward_inner(x, Some(cache))
+        self.forward_inner(x, Some(cache), Attend::Causal)
     }
 
-    fn forward_inner(&self, x: Tensor<B, 3>, cache: Option<&mut KvCache<B>>) -> Tensor<B, 3> {
+    fn forward_inner(
+        &self,
+        x: Tensor<B, 3>,
+        cache: Option<&mut KvCache<B>>,
+        attend: Attend,
+    ) -> Tensor<B, 3> {
         let attn = |t: Tensor<B, 3>| match cache {
             Some(c) => self.attn.forward_cached(t, c),
-            None => self.attn.forward(t),
+            None => self.attn.forward_as(t, attend),
         };
         match self.placement {
             NormPlacement::Pre => {
@@ -97,6 +111,47 @@ mod tests {
             let x =
                 Tensor::<TestBackend, 3>::random([2, 6, cfg.d_model], Distribution::Default, &d);
             assert_eq!(block.forward(x).dims(), [2, 6, cfg.d_model]);
+        }
+    }
+
+    /// Adding [`Attend`] must not have moved the existing path. Every caller in
+    /// the crate uses `forward`, so if `forward` and `forward_as(.., Causal)`
+    /// ever diverge, the language model changed while nobody was looking at it.
+    #[test]
+    fn the_causal_mode_is_exactly_what_forward_always_did() {
+        let d = Default::default();
+        let cfg = ModelConfig::tiny();
+        let block = Block::<TestBackend>::new(&cfg, &d);
+        let x = Tensor::<TestBackend, 3>::random([2, 6, cfg.d_model], Distribution::Default, &d);
+
+        let want: Vec<f32> = block.forward(x.clone()).into_data().to_vec().unwrap();
+        let got: Vec<f32> = block
+            .forward_as(x, Attend::Causal)
+            .into_data()
+            .to_vec()
+            .unwrap();
+        assert_eq!(want, got);
+    }
+
+    /// ...and the bidirectional mode must actually differ, or the argument is
+    /// decorative. Both placements, because `Post` routes the residual
+    /// differently and could in principle wash the difference out.
+    #[test]
+    fn the_bidirectional_mode_actually_changes_the_output() {
+        let d = Default::default();
+        for placement in [NormPlacement::Pre, NormPlacement::Post] {
+            let cfg = ModelConfig {
+                norm_placement: placement,
+                ..ModelConfig::tiny()
+            };
+            let block = Block::<TestBackend>::new(&cfg, &d);
+            let x =
+                Tensor::<TestBackend, 3>::random([2, 6, cfg.d_model], Distribution::Default, &d);
+
+            let causal = block.forward_as(x.clone(), Attend::Causal);
+            let bidi = block.forward_as(x, Attend::Bidirectional);
+            let delta: f32 = (causal - bidi).abs().sum().into_scalar();
+            assert!(delta > 1e-4, "{placement:?}: the mask made no difference");
         }
     }
 
