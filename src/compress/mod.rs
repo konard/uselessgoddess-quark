@@ -13,7 +13,9 @@
 pub mod config;
 pub mod model;
 pub mod quantize;
+pub mod train;
 
 pub use config::CompressConfig;
 pub use model::Compressor;
 pub use quantize::Fsq;
+pub use train::CompressTrainConfig;

@@ -162,6 +162,7 @@ src/model/         attention, SwiGLU, RMSNorm, RoPE, KV cache, the LM
 src/data/          BPE, shards, strided windows, batching
 src/train/         the burn Learner harness
 src/eval/          corpus PPL, BLiMP, generation
+src/compress/      the optional text compressor (docs/COMPRESSION.md)
 experiments/       the scaling analysis, the GPT-2 baseline, the protocol fixture
 docs/DESIGN.md     why any of this
 ```
@@ -169,7 +170,7 @@ docs/DESIGN.md     why any of this
 ## Tests
 
 ```sh
-cargo test --all-targets      # 104, all CPU
+cargo test --all-targets      # 179, all CPU
 ```
 
 Microtests only, per the issue. The heaviest trains a 2-layer toy on ~600 tokens
