@@ -9,6 +9,10 @@ name: GPU experiments
 #
 # It is `workflow_dispatch` only. Nothing here should fire on a push: a sweep is
 # hours of GPU time and a deliberate act, not a side effect of committing.
+#
+# Re-dispatching *continues* an interrupted sweep rather than restarting it:
+# finished experiments are skipped and interrupted ones resume from their last
+# checkpoint. `force: true` is the way to redo the work deliberately.
 
 on:
   workflow_dispatch:
@@ -35,6 +39,14 @@ on:
         description: "Folder holding wiki.{train,valid,test}.tokens and blimp/ (blank = auto-locate _work/)"
         type: string
         default: ""
+      blimp-dir:
+        description: "Folder holding BLiMP's *.jsonl directly, usually blimp/data (blank = auto-locate)"
+        type: string
+        default: ""
+      force:
+        description: "Redo finished experiments instead of continuing from where the last run stopped"
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -58,7 +70,15 @@ jobs:
     # its soft time budget is still stopped rather than pinning the GPU forever.
     timeout-minutes: 600
     steps:
+      # `clean: false` deliberately. The default runs `git clean -ffdx` over the
+      # workspace, which deletes `artifacts/` -- every finished epoch of the
+      # previous dispatch -- before the driver gets a chance to continue from it.
+      # A sweep is hours long and gets interrupted; re-dispatching has to resume
+      # it, not silently start over (issue #10). Tracked files are still reset,
+      # so the checkout is as clean as it needs to be.
       - uses: actions/checkout@v4
+        with:
+          clean: false
 
       # No rust-cache action here: it targets the hosted-runner cache and would
       # fight the self-hosted runner's own persistent ~/.cargo and target/. The
@@ -83,6 +103,8 @@ jobs:
           BENCH_BACKENDS: ${{ inputs.bench-backends }}
           TIME_BUDGET_HOURS: ${{ inputs.time-budget-hours }}
           QUARK_DATA_DIR: ${{ inputs.data-dir }}
+          QUARK_BLIMP_DIR: ${{ inputs.blimp-dir }}
+          FORCE: ${{ inputs.force && '1' || '0' }}
         run: |
           chmod +x ./experiments/gpu/run_experiments.sh
           ./experiments/gpu/run_experiments.sh

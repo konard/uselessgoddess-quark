@@ -4,7 +4,11 @@
 Inputs are the files run_experiments.sh drops in the results dir:
 
   <name>.eval.txt   -- stdout of `quark eval` (word perplexity / BLiMP lines)
-  <name>.secs       -- wall-clock seconds of the training run (a bare number)
+  <name>.secs       -- wall-clock seconds of the training run (a bare number),
+                       written only once that run has finished, and summed over
+                       every leg of it if it was interrupted and resumed. The
+                       driver keeps the running total in <name>.ms, which is its
+                       own bookkeeping and not read here.
   backends.json     -- {backend: {"seconds": s, "tokens": t}} from the benchmark
 
 Output is results.json, the file experiments/report.py overlays. This script

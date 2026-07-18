@@ -61,6 +61,15 @@ jobs:
       - name: Check the shard denominators end to end
         run: ./experiments/check_shard_denominators.sh
 
+      # The experiment driver is the one piece here that only runs on a machine
+      # nobody in CI has, which is how it shipped with a data locator that could
+      # not find the data outside Actions and a loop that restarted every
+      # interrupted run from zero (issue #10). Both are shell-level properties,
+      # so `stub_quark.py` plays the binary's part and both become testable
+      # without a GPU. About a minute.
+      - name: Check the experiment driver finds its data and resumes
+        run: ./experiments/gpu/test_run_experiments.sh
+
   # The GPU backends, none of which a runner can execute: no runner has a GPU.
   # `check` at least guarantees these paths still compile -- otherwise they would
   # break silently and be discovered by the one person who can run them.

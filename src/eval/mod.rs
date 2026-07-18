@@ -20,7 +20,11 @@ pub mod generate;
 use std::{path::PathBuf, sync::Arc};
 
 use anyhow::{bail, Context, Result};
-use burn::{module::Module, prelude::Backend, record::CompactRecorder};
+use burn::{
+    module::Module,
+    prelude::Backend,
+    record::{CompactRecorder, FileRecorder},
+};
 
 pub use blimp::{BlimpScore, BlimpSuite};
 pub use corpus::{evaluate, CorpusScore, EvalConfig};
@@ -56,6 +60,11 @@ pub fn load_model<B: Backend>(
     model_path: &std::path::Path,
     device: &B::Device,
 ) -> Result<(QuarkLm<B>, TrainConfig)> {
+    let extension = <CompactRecorder as FileRecorder<B>>::file_extension();
+    let record = model_path.with_extension(extension);
+    if !record.is_file() {
+        bail!("{}", missing_record_message(model_path, &record, extension));
+    }
     let train_config = TrainConfig::load(config_path)
         .with_context(|| format!("reading the run's config {}", config_path.display()))?;
     let model = QuarkLm::<B>::new(train_config.model.clone(), device)
@@ -76,6 +85,74 @@ pub fn load_model<B: Backend>(
     }
 
     Ok((model, train_config))
+}
+
+/// What to say when the record `--model` names is not there.
+///
+/// burn appends the recorder's extension itself, so `--model foo` reads
+/// `foo.mpk` and the path in the error is not the path the user typed. Left to
+/// burn, the whole diagnosis is `FileNotFound("No such file or directory")` --
+/// which is what a run against a *directory* of checkpoints produced on the
+/// maintainer's machine (PR #11), costing four attempts to guess the spelling
+/// the flag wanted. Everything needed to fix it is on disk, so name it: the file
+/// that was looked for, and the records that do exist nearby.
+fn missing_record_message(
+    model_path: &std::path::Path,
+    record: &std::path::Path,
+    extension: &str,
+) -> String {
+    let mut msg = if model_path.is_dir() {
+        format!(
+            "{} is a directory; `--model` wants the record itself, as a path without the \
+             .{extension} extension (the recorder sets it)",
+            model_path.display(),
+        )
+    } else {
+        format!(
+            "no model record at {} (`--model` is a path *without* the .{extension} extension, \
+             which the recorder sets)",
+            record.display(),
+        )
+    };
+    // A directory holds candidates; a file path's siblings are the candidates.
+    let dir = if model_path.is_dir() {
+        model_path.to_path_buf()
+    } else {
+        model_path.parent().unwrap_or(model_path).to_path_buf()
+    };
+    let mut found = records_in(&dir, extension);
+    found.extend(records_in(&dir.join("checkpoint"), extension));
+    if !found.is_empty() {
+        msg += "\n\nrecords that do exist (pass one of these to --model):";
+        for path in found {
+            msg += &format!("\n  {}", path.display());
+        }
+    }
+    msg
+}
+
+/// The loadable records in `dir`, named the way `--model` wants them: with the
+/// extension stripped back off.
+fn records_in(dir: &std::path::Path, extension: &str) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut found: Vec<_> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.extension().is_some_and(|e| e == extension))
+        // Optimiser and scheduler state are recorded next to the weights and are
+        // not loadable as a model, so offering them would just be a second wrong
+        // guess.
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("model"))
+        })
+        .map(|p| p.with_extension(""))
+        .collect();
+    found.sort();
+    found
 }
 
 /// Everything `quark eval` needs to know.
@@ -322,5 +399,68 @@ mod tests {
             err.contains("does not belong to these weights"),
             "got: {err}"
         );
+    }
+
+    /// Pointing `--model` at a directory of checkpoints is the natural first
+    /// guess -- it is what happened on the maintainer's machine (PR #11), and
+    /// burn answered `FileNotFound("No such file or directory")`, which names
+    /// neither the file it wanted nor the ones sitting right there.
+    #[test]
+    fn a_directory_of_checkpoints_is_answered_with_the_checkpoints_in_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config_path, _, _) = artifacts(dir.path());
+        let checkpoints = dir.path().join("checkpoint");
+        std::fs::create_dir_all(&checkpoints).unwrap();
+        for name in [
+            "model-3.mpk",
+            "model-4.mpk",
+            "optim-4.mpk",
+            "scheduler-4.mpk",
+        ] {
+            std::fs::write(checkpoints.join(name), []).unwrap();
+        }
+
+        let err = load_model::<TestBackend>(&config_path, &checkpoints, &Default::default())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is a directory"), "got: {err}");
+        assert!(err.contains("checkpoint/model-3"), "got: {err}");
+        assert!(err.contains("checkpoint/model-4"), "got: {err}");
+        // Suggesting the optimiser state would just be the next wrong guess, and
+        // the extension is the part the flag does not want.
+        assert!(!err.contains("optim"), "got: {err}");
+        assert!(!err.contains("model-4.mpk"), "got: {err}");
+    }
+
+    /// The default `--model artifacts/run/model` misses by a whole run
+    /// directory, and the record that exists is one level away.
+    #[test]
+    fn a_missing_record_names_the_file_it_looked_for_and_its_neighbours() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config_path, _, _) = artifacts(dir.path());
+
+        let err =
+            load_model::<TestBackend>(&config_path, &dir.path().join("mdoel"), &Default::default())
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("mdoel.mpk"), "got: {err}");
+        assert!(err.contains("the .mpk extension"), "got: {err}");
+        // `artifacts()` saved one, as a real run would.
+        assert!(err.contains("model"), "got: {err}");
+    }
+
+    /// Naming the record with its extension is what the flag's help says not to
+    /// do, but `set_extension` makes it work -- and an error for a file that is
+    /// plainly there would be indefensible.
+    #[test]
+    fn spelling_out_the_extension_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config_path, model_path, _) = artifacts(dir.path());
+        load_model::<TestBackend>(
+            &config_path,
+            &model_path.with_extension("mpk"),
+            &Default::default(),
+        )
+        .unwrap();
     }
 }

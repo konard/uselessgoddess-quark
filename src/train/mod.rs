@@ -33,7 +33,7 @@ use burn::{
     module::{Module, ModuleVisitor, Param},
     optim::AdamWConfig,
     prelude::Backend,
-    record::CompactRecorder,
+    record::{CompactRecorder, FileRecorder},
     tensor::{backend::AutodiffBackend, Tensor},
     train::{
         metric::{LearningRateMetric, LossMetric},
@@ -562,8 +562,8 @@ fn lr_scheduler_config(config: &TrainConfig, total_batches: usize) -> ComposedLr
 /// the best checkpoint is chosen by a metric nobody recorded.
 const LOSS_METRIC: &str = "Loss";
 
-/// The epoch whose mean validation loss was lowest, read back from the metric
-/// logs in `artifact_dir`.
+/// Every epoch that recorded a validation loss in `artifact_dir`, ranked by that
+/// loss, lowest first.
 ///
 /// This deliberately re-derives what burn's checkpointing strategy already
 /// decided, because burn does not report it: `LearningResult` carries the model,
@@ -574,29 +574,71 @@ const LOSS_METRIC: &str = "Loss";
 /// the same logs with the same `Aggregate::Mean` per epoch
 /// (`burn-train/src/learner/summary.rs`).
 ///
-/// `None` when no epoch can be named -- no logs, or every epoch diverged to NaN.
+/// A *ranking* rather than a single winner because the winner's checkpoint is
+/// not guaranteed to exist: burn prunes the checkpoints it did not select, and
+/// across a resumed run the logs outlive the files. See
+/// [`best_recoverable_epoch`].
+///
+/// Empty when no epoch can be named -- no logs, or every epoch diverged to NaN.
 /// The caller has to cope rather than pick a wrong one.
-fn best_valid_loss_epoch(artifact_dir: &Path) -> Option<usize> {
-    let summary = LearnerSummary::new(artifact_dir, &[LOSS_METRIC]).ok()?;
-    let loss = summary
-        .metrics
-        .valid
-        .iter()
-        .find(|m| m.name == LOSS_METRIC)?;
+fn epochs_by_valid_loss(artifact_dir: &Path) -> Vec<usize> {
+    let Ok(summary) = LearnerSummary::new(artifact_dir, &[LOSS_METRIC]) else {
+        return Vec::new();
+    };
+    let Some(loss) = summary.metrics.valid.iter().find(|m| m.name == LOSS_METRIC) else {
+        return Vec::new();
+    };
 
-    loss.entries
+    let mut ranked: Vec<_> = loss
+        .entries
         .iter()
         // A diverged epoch is not a candidate. Filtered rather than ordered,
         // because NaN has no order: `partial_cmp` returns `None` against it, and
         // a comparator that unwraps would panic on exactly the run that needs
         // this most.
         .filter(|e| !e.value.is_nan())
-        .min_by(|a, b| {
-            a.value
-                .partial_cmp(&b.value)
-                .expect("NaN entries are filtered out above")
+        .collect();
+    ranked.sort_by(|a, b| {
+        a.value
+            .partial_cmp(&b.value)
+            .expect("NaN entries are filtered out above")
+            // Ties broken towards the earlier epoch, matching
+            // `NumericMetricsAggregate::find_epoch`, whose comparison is the
+            // strict `value < current_value` and so keeps the first of a tie.
+            .then(a.step.cmp(&b.step))
+    });
+    ranked.into_iter().map(|e| e.step).collect()
+}
+
+/// The best epoch by validation loss whose checkpoint is *still on disk*, with
+/// `extension` the one the checkpoint recorder appends.
+///
+/// The qualifier is the whole point. burn's checkpointer prunes: `FileCheckpointer`
+/// deletes the checkpoint of every epoch the strategy did not select, while
+/// `FileMetricLogger` keeps that epoch's log directory. Within one run the two
+/// still agree, because the epoch the strategy kept is the epoch the logs name.
+/// Across a *resumed* run they need not:
+///
+///  * the first run keeps epoch 2 and prunes epoch 1;
+///  * `--resume-from-epoch 2` replays epochs 3.. into the same directory, and
+///    the checkpointer -- which starts its own history -- prunes what the new
+///    epochs beat;
+///  * `LearnerSummary` still reads epochs 1.., logs and all, so the ranking can
+///    name epoch 1, whose file went away hours ago.
+///
+/// Taking the ranking's head unconditionally then fails at `load_file`, at the
+/// last step of `run`, after all the training -- which is exactly the resumed
+/// run this must not lose (issue #10). So the head is a preference, not a
+/// requirement: the best epoch that can actually be loaded wins.
+fn best_recoverable_epoch(artifact_dir: &Path, extension: &str) -> Option<usize> {
+    let checkpoints = artifact_dir.join("checkpoint");
+    epochs_by_valid_loss(artifact_dir)
+        .into_iter()
+        .find(|epoch| {
+            checkpoints
+                .join(format!("model-{epoch}.{extension}"))
+                .is_file()
         })
-        .map(|e| e.step)
 }
 
 /// The highest epoch number already recorded in `artifact_dir`'s metric logs,
@@ -826,7 +868,12 @@ pub fn run<B: AutodiffBackend>(
     // checkpoint (the default `MetricCheckpointingStrategy` selects on mean
     // valid loss, and never deletes the epoch it selected), but it does not tell
     // us which epoch that was, so the epoch is read back from the same logs.
-    let model = match best_valid_loss_epoch(&config.artifact_dir) {
+    //
+    // The epoch has to be one whose checkpoint survived burn's pruning, or this
+    // dies at the very last step of a run that is otherwise finished -- see
+    // `best_recoverable_epoch`.
+    let extension = <CompactRecorder as FileRecorder<B::InnerBackend>>::file_extension();
+    let model = match best_recoverable_epoch(&config.artifact_dir, extension) {
         Some(epoch) => {
             // The path `FileCheckpointer` writes to: `<dir>/checkpoint/model-<epoch>`,
             // with the recorder supplying the extension.
@@ -843,15 +890,28 @@ pub fn run<B: AutodiffBackend>(
                         path.display()
                     )
                 })?;
+            if epochs_by_valid_loss(&config.artifact_dir).first() != Some(&epoch) {
+                // Worth saying out loud: the model handed back is not the one
+                // the logs call best. That happens when the nominal best belongs
+                // to an earlier leg of a resumed run whose checkpoint has since
+                // been pruned, and the honest recovery is the best epoch still
+                // on disk.
+                tracing::warn!(
+                    epoch,
+                    "the lowest-loss epoch has no checkpoint left on disk; recovered the best \
+                     epoch that does"
+                );
+            }
             tracing::info!(epoch, "recovered the best epoch by validation loss");
             best
         }
-        // Nothing to select on: no metric logs, or every epoch diverged. The
-        // last model is then the only honest answer, and the log says which one
-        // this is rather than claiming a best that was never chosen.
+        // Nothing to select on: no metric logs, every epoch diverged, or no
+        // checkpoint outlived the run. The last model is then the only honest
+        // answer, and the log says which one this is rather than claiming a best
+        // that was never chosen.
         None => {
             tracing::warn!(
-                "no validation loss was recorded, so no best epoch could be chosen; \
+                "no epoch with a validation loss and a checkpoint on disk could be named; \
                  falling back to the model from the final epoch"
             );
             last
@@ -990,6 +1050,22 @@ mod tests {
         std::fs::write(dir.join("Loss.log"), body).unwrap();
     }
 
+    /// The head of the ranking: the epoch the logs call best, whether or not its
+    /// checkpoint is still there. What `run` needs is
+    /// [`best_recoverable_epoch`]; what the selection rule is *about* is this.
+    fn best_valid_loss_epoch(artifact_dir: &std::path::Path) -> Option<usize> {
+        epochs_by_valid_loss(artifact_dir).first().copied()
+    }
+
+    /// An empty `checkpoint/model-<epoch>.mpk`, which is all
+    /// `best_recoverable_epoch` looks at -- it selects a path, it does not read
+    /// weights.
+    fn write_checkpoint(artifact_dir: &std::path::Path, epoch: usize) {
+        let dir = artifact_dir.join("checkpoint");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("model-{epoch}.mpk")), []).unwrap();
+    }
+
     /// The point of the whole exercise: the best epoch is the one with the
     /// lowest validation loss, which is *not* in general the last one. A run
     /// that overfits after epoch 2 must still hand back epoch 2.
@@ -1081,6 +1157,87 @@ mod tests {
 
         assert_eq!(best_valid_loss_epoch(dir.path()), Some(3));
         assert_eq!(recorded_epochs(dir.path()), Some(4));
+    }
+
+    /// The resume failure from issue #10, at the level of the selection rule.
+    ///
+    /// A run trained 3 epochs, kept epoch 1 as best and pruned 2-3; it was then
+    /// killed and resumed from epoch 3, which added epoch 4. The logs still hold
+    /// all four epochs and still call epoch 1 the best -- but epoch 1's
+    /// checkpoint was pruned by the resumed leg, so loading it fails, and it
+    /// fails at the last statement of `run`, after every epoch has been paid
+    /// for. The best epoch that is still on disk is the answer instead.
+    #[test]
+    fn a_pruned_best_epoch_falls_through_to_the_best_one_still_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        for (epoch, loss) in [(1, 1.0), (2, 2.0), (3, 1.5), (4, 1.2)] {
+            write_valid_loss_log(dir.path(), epoch, &[(loss, 512)]);
+        }
+        // What the resumed leg left behind.
+        write_checkpoint(dir.path(), 4);
+        write_checkpoint(dir.path(), 3);
+
+        assert_eq!(
+            best_valid_loss_epoch(dir.path()),
+            Some(1),
+            "the logs still name epoch 1, which is why the unguarded load failed"
+        );
+        assert_eq!(
+            best_recoverable_epoch(dir.path(), "mpk"),
+            Some(4),
+            "epoch 4 is the lowest-loss epoch whose checkpoint survived"
+        );
+    }
+
+    /// Preference, not merely availability: with every checkpoint present the
+    /// answer must still be the lowest-loss epoch, not the newest file.
+    #[test]
+    fn with_every_checkpoint_present_the_lowest_loss_epoch_still_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        for (epoch, loss) in [(1, 1.0), (2, 0.5), (3, 2.0)] {
+            write_valid_loss_log(dir.path(), epoch, &[(loss, 512)]);
+            write_checkpoint(dir.path(), epoch);
+        }
+
+        assert_eq!(best_recoverable_epoch(dir.path(), "mpk"), Some(2));
+    }
+
+    /// No checkpoints at all -- an interrupted run whose files were cleared, or
+    /// a checkpointer that never wrote -- names no epoch, so `run` falls back to
+    /// the final model rather than failing on a path that is not there.
+    #[test]
+    fn no_checkpoint_on_disk_names_no_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        write_valid_loss_log(dir.path(), 1, &[(1.0, 512)]);
+
+        assert_eq!(best_valid_loss_epoch(dir.path()), Some(1));
+        assert_eq!(best_recoverable_epoch(dir.path(), "mpk"), None);
+    }
+
+    /// The extension comes from the recorder rather than from a literal here,
+    /// because a checkpoint written as `.mpk` and looked for as anything else is
+    /// invisible -- the exact failure this function exists to prevent, moved one
+    /// level down.
+    #[test]
+    fn the_checkpoint_extension_is_the_recorders_own() {
+        assert_eq!(
+            <CompactRecorder as FileRecorder<
+                <TestAutodiffBackend as AutodiffBackend>::InnerBackend,
+            >>::file_extension(),
+            "mpk"
+        );
+    }
+
+    /// A diverged epoch stays out of the ranking even when it is the only one
+    /// with a checkpoint: NaN is not a loss to prefer, and the fallback to the
+    /// final model is the honest answer.
+    #[test]
+    fn a_diverged_epoch_is_not_recoverable_either() {
+        let dir = tempfile::tempdir().unwrap();
+        write_valid_loss_log(dir.path(), 1, &[(f64::NAN, 512)]);
+        write_checkpoint(dir.path(), 1);
+
+        assert_eq!(best_recoverable_epoch(dir.path(), "mpk"), None);
     }
 
     /// So a fresh run into a used directory is refused, and the message says what
@@ -1780,6 +1937,62 @@ mod tests {
             saved == best_ckpt,
             "model.mpk must be epoch {best}'s weights (the lowest validation loss), \
              but it does not match that checkpoint; losses were {losses:?}"
+        );
+    }
+
+    /// End to end, the failure that made the experiment driver's resume useless
+    /// (issue #10): a resumed run must finish even when the epoch its logs call
+    /// best no longer has a checkpoint.
+    ///
+    /// Staged rather than waited for, because reproducing the pruning takes
+    /// hours of real training: the first leg runs for real, then epoch 1 is made
+    /// the nominal best (its logged loss is rewritten) and its checkpoint is
+    /// removed, which is exactly the state burn leaves behind when a later leg's
+    /// checkpointer prunes a file whose metric log it does not touch. Before the
+    /// fix this run trained every epoch and then died on `load_file`, losing the
+    /// lot.
+    #[test]
+    fn a_resumed_run_survives_the_pruning_of_its_nominal_best_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = tiny_config(dir.path());
+        cfg.num_epochs = 2;
+        write_shard(&cfg.train_shard, 600, cfg.model.vocab_size);
+        write_shard(&cfg.valid_shard, 200, cfg.model.vocab_size);
+
+        run::<B>(cfg.clone(), Default::default()).unwrap();
+        let checkpoints = cfg.artifact_dir.join("checkpoint");
+        assert!(
+            checkpoints.join("model-2.mpk").is_file() && checkpoints.join("optim-2.mpk").is_file(),
+            "resuming from epoch 2 needs epoch 2's checkpoint, which burn's \
+             KeepLastNCheckpoints(2) should have kept"
+        );
+
+        // Epoch 1 becomes the unbeatable best on paper, and vanishes from disk.
+        write_valid_loss_log(&cfg.artifact_dir, 1, &[(1e-6, 512)]);
+        std::fs::remove_file(checkpoints.join("model-1.mpk")).unwrap();
+        assert_eq!(epochs_by_valid_loss(&cfg.artifact_dir).first(), Some(&1));
+
+        std::fs::remove_file(cfg.artifact_dir.join("model.mpk")).unwrap();
+        cfg.num_epochs = 3;
+        cfg.resume_from_epoch = Some(2);
+        run::<B>(cfg.clone(), Default::default())
+            .expect("a resumed run must not die selecting a checkpoint it already trained");
+
+        assert!(
+            cfg.artifact_dir.join("model.mpk").is_file(),
+            "the resumed run must leave the model it paid for"
+        );
+        let saved = std::fs::read(cfg.artifact_dir.join("model.mpk")).unwrap();
+        let recovered = best_recoverable_epoch(&cfg.artifact_dir, "mpk")
+            .expect("some epoch's checkpoint must have survived the resumed leg");
+        assert_ne!(
+            recovered, 1,
+            "epoch 1 has no checkpoint, so it cannot be the one recovered"
+        );
+        let ckpt = std::fs::read(checkpoints.join(format!("model-{recovered}.mpk"))).unwrap();
+        assert!(
+            saved == ckpt,
+            "model.mpk must be the weights of epoch {recovered}, the best epoch still on disk"
         );
     }
 
