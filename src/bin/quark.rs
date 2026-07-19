@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use quark::{
-    compress::{CompressConfig, CompressTrainConfig},
+    compress::{CompressConfig, CompressEvalConfig, CompressTrainConfig},
     data,
     eval::{EvalConfig, EvalRun, GenerationConfig},
     TrainConfig,
@@ -326,9 +326,21 @@ enum Command {
         /// <https://github.com/alexwarstadt/blimp>.
         #[arg(long, value_name = "DIR")]
         blimp: Option<PathBuf>,
-        /// Decode the fixed prompt set.
+        /// Decode the fixed prompt set. For a compressor run this round-trips
+        /// `--samples` spans of `--ppl` instead, since a compressor continues
+        /// nothing -- it reconstructs.
         #[arg(long)]
         generate: bool,
+        /// Compressor runs only: spans to reconstruct. Free-running decoding is
+        /// one forward pass per token, so a full shard is hours; this caps the
+        /// work and the report says how many spans it covered. `0` sweeps
+        /// everything.
+        #[arg(long, value_name = "N")]
+        max_spans: Option<usize>,
+        /// Compressor runs only: spans to print side by side under
+        /// `--generate`.
+        #[arg(long, default_value_t = 4)]
+        samples: usize,
         #[arg(long, default_value_t = 512)]
         seq_len: usize,
         /// How far the evaluation window advances. Defaults to half of
@@ -535,6 +547,8 @@ fn main() -> Result<()> {
             ppl,
             blimp,
             generate,
+            max_spans,
+            samples,
             seq_len,
             stride,
             batch_size,
@@ -565,8 +579,21 @@ fn main() -> Result<()> {
                     ..Default::default()
                 },
                 blimp_batch_size: batch_size.max(2),
+                compress: CompressEvalConfig {
+                    batch_size,
+                    num_workers: 2,
+                    // `--max-spans 0` is "no cap", spelled the way a shell can
+                    // spell it; absent is the default cap.
+                    max_spans: match max_spans {
+                        Some(0) => None,
+                        Some(n) => Some(n),
+                        None => CompressEvalConfig::default().max_spans,
+                    },
+                },
+                compress_samples: samples,
             };
             run.corpus.validate()?;
+            run.compress.validate()?;
 
             let backend = backend.unwrap_or_default();
             tracing::info!(?backend, "starting evaluation");

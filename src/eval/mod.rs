@@ -31,6 +31,10 @@ pub use corpus::{evaluate, CorpusScore, EvalConfig};
 pub use generate::{GenerationConfig, Sample};
 
 use crate::{
+    compress::{
+        eval::{load_compressor, CompressEvalConfig},
+        CompressTrainConfig,
+    },
     data::{tokenizer, Shard},
     model::QuarkLm,
     TrainConfig,
@@ -96,7 +100,7 @@ pub fn load_model<B: Backend>(
 /// maintainer's machine (PR #11), costing four attempts to guess the spelling
 /// the flag wanted. Everything needed to fix it is on disk, so name it: the file
 /// that was looked for, and the records that do exist nearby.
-fn missing_record_message(
+pub(crate) fn missing_record_message(
     model_path: &std::path::Path,
     record: &std::path::Path,
     extension: &str,
@@ -172,6 +176,96 @@ pub struct EvalRun {
     pub corpus: EvalConfig,
     pub generation: GenerationConfig,
     pub blimp_batch_size: usize,
+    /// How to sweep a *compressor* run, when the config turns out to describe
+    /// one. Ignored otherwise.
+    pub compress: CompressEvalConfig,
+    /// Spans to round-trip and print under `--generate`, for a compressor run.
+    pub compress_samples: usize,
+}
+
+/// Whether `path` holds a [`CompressTrainConfig`] rather than a [`TrainConfig`].
+///
+/// Decided by the presence of the `compress` key rather than by trying both
+/// parsers, because "which config is this" deserves a better answer than the
+/// second parser's error. It is also the failure the maintainer actually hit
+/// (issue #14): a compressor run's `config.json` fed to `quark eval` reported
+/// `missing field 'model' at line 74`, which names a field that *is* there --
+/// nested one level down, in a config of the other kind.
+fn is_compress_config(path: &std::path::Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| v.get("compress").map(|c| c.is_object()))
+        .unwrap_or(false)
+}
+
+/// Evaluate a compressor run: reconstruction, the rate, and sample round trips.
+///
+/// Shares the flags of the language-model path deliberately -- `--ppl` names
+/// the shard to measure on and `--generate` asks for text a human can read --
+/// because they mean the same thing here. What differs is what is measured on
+/// them, and [`crate::compress::eval`] documents why those are the numbers.
+fn run_compressor<B: Backend>(
+    run: &EvalRun,
+    config_path: &std::path::Path,
+    model_path: &std::path::Path,
+    device: &B::Device,
+) -> Result<String> {
+    use crate::compress::eval as ceval;
+
+    let config = CompressTrainConfig::load(config_path)
+        .with_context(|| format!("reading the run's config {}", config_path.display()))?;
+    let model = load_compressor::<B>(&config, model_path, device)?;
+    let c = &config.compress;
+
+    let mut out = format!(
+        "compressor {} ({} parameters, {} tokens -> {} slots)\n\n{}\n",
+        model_path.display(),
+        c.param_count(),
+        c.span_len,
+        c.n_slots,
+        c.budget_table(),
+    );
+
+    // BLiMP scores a language model's preference between two sentences, and a
+    // compressor has no next-token distribution to prefer with. Saying so beats
+    // ignoring the flag, which would look like a suite that scored 0%.
+    if run.blimp_dir.is_some() {
+        out += "\n== BLiMP ==\nskipped: BLiMP is a language-model evaluation and this run is a \
+                compressor, which has no next-token distribution to score a minimal pair with\n";
+    }
+
+    if let Some(path) = &run.shard {
+        let shard = Arc::new(
+            Shard::open(path).with_context(|| format!("opening shard {}", path.display()))?,
+        );
+        let score = ceval::evaluate(&model, shard, &run.compress, device)?;
+        out += &format!(
+            "\n== reconstruction: {} ==\n{}\n",
+            path.display(),
+            score.report()
+        );
+    } else {
+        out += "\nno --ppl shard given, so nothing was reconstructed; pass the test shard to \
+                measure this compressor\n";
+    }
+
+    if run.generate {
+        let Some(path) = &run.shard else {
+            bail!(
+                "--generate needs text to round-trip, and a compressor has no prompt set of its \
+                 own: pass --ppl <shard> as well"
+            );
+        };
+        let tok = tokenizer::load(&run.tokenizer_path)?;
+        let shard = Arc::new(Shard::open(path)?);
+        let samples = ceval::samples(&model, &tok, shard, run.compress_samples, device)?;
+        out += &format!("\n== round trips ==\n{}", ceval::report(&samples));
+    }
+
+    Ok(out)
 }
 
 /// Run whichever evaluations were asked for and return the report as text.
@@ -188,6 +282,14 @@ pub fn run<B: Backend>(run: &EvalRun, device: &B::Device) -> Result<String> {
         .model_path
         .clone()
         .unwrap_or_else(|| run.artifact_dir.join("model"));
+
+    // A compressor run writes a config of a different shape, and `quark eval`
+    // is the command a user reaches for either way. Dispatching on the file
+    // rather than on a flag means the obvious invocation works instead of
+    // failing on a field that is present but nested (issue #14).
+    if is_compress_config(&config_path) {
+        return run_compressor::<B>(run, &config_path, &model_path, device);
+    }
 
     let (model, train_config) = load_model::<B>(&config_path, &model_path, device)?;
     let mut out = format!(
@@ -309,6 +411,12 @@ mod tests {
                 ..Default::default()
             },
             blimp_batch_size: 4,
+            compress: CompressEvalConfig {
+                batch_size: 2,
+                num_workers: 1,
+                max_spans: None,
+            },
+            compress_samples: 2,
         }
     }
 

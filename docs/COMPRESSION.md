@@ -405,6 +405,49 @@ quark compress --preset tiny --backend ndarray  # a toy, for a smoke test
 `--span-len` moves the run's window too (`sync()` carries it), so the two halves
 of the config cannot drift apart from a flag.
 
+### 9.1 Evaluating a finished run
+
+```bash
+# The headline (H1) and the rate (H2), on the test split.
+quark eval --backend wgpu \
+  --config artifacts/compress/config.json \
+  --model artifacts/compress/model \
+  --ppl artifacts/test.bin
+
+# ...and four spans printed in and out, for a human to read.
+quark eval --backend wgpu \
+  --config artifacts/compress/config.json --model artifacts/compress/model \
+  --ppl artifacts/test.bin --generate --samples 4
+
+quark eval ... --max-spans 0    # no cap: sweep the whole shard
+```
+
+`quark eval` is the same command for both kinds of run: it reads the config and
+notices which one it is (a compressor's has a `compress` key). No flag selects
+this, because the config already knows and a flag that could disagree with it
+would only be one more way to get a wrong number.
+
+What it prints, and why those numbers, is §4:
+
+| Line | §4 | Read it as |
+|---|---|---|
+| free-running accuracy | H1 | **the** result — decoded from the latent alone |
+| exact-span rate | H1 | spans recovered token-for-token; harsher, and the one that matters for `encoder → body → decoder` |
+| teacher-forced accuracy | H1′ | an upper bound, never a result |
+| exposure gap | H1′ | large ⇒ the decoder is leaning on its prefix, not the bottleneck |
+| bits per token | H2 | the rate the accuracy was bought at; §1.6 |
+| reconstruction NLL | — | the training loss, printed last and labelled |
+
+Free-running decoding is one forward pass per token, so `--max-spans` defaults
+to 512 spans (131k tokens at the reference config) rather than the whole shard.
+The report always states how many spans it covered and how many the shard held,
+so a capped run is a measurement rather than a guess.
+
+H3 (`CR@99`) is a curve over several trained compressors and belongs to a sweep,
+not to one run's evaluation; H4 (downstream retention) needs a `QuarkLm` beside
+the compressor and is not wired up yet. Both are named in §4 and neither is
+silently reported as something it is not.
+
 ---
 
 ## 10. Open questions

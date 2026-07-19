@@ -11,11 +11,13 @@
 //! Nothing here is reachable from a normal training run.
 
 pub mod config;
+pub mod eval;
 pub mod model;
 pub mod quantize;
 pub mod train;
 
 pub use config::CompressConfig;
+pub use eval::{CompressEvalConfig, ReconstructionScore};
 pub use model::Compressor;
 pub use quantize::Fsq;
 pub use train::CompressTrainConfig;
