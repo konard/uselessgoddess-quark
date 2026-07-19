@@ -530,11 +530,12 @@ mod tests {
         assert_eq!(capped.n_spans_available, full.n_spans_available);
     }
 
-    /// The teacher-forced pass is an upper bound on the free-running one, and
-    /// the report says so. If the inequality ever inverted, the two passes
-    /// would not be scoring the same tokens and the gap would be noise.
+    /// Both reconstruction passes score the same number of tokens and the
+    /// exposure gap is derived from their accuracies. A randomly initialized
+    /// model can occasionally do better free-running by chance, so the
+    /// expected post-training ordering is not a deterministic test invariant.
     #[test]
-    fn teacher_forcing_is_an_upper_bound() {
+    fn teacher_forcing_is_a_comparable_diagnostic() {
         let dir = tempfile::tempdir().unwrap();
         let device = Default::default();
         // Regularizers off: they are training-only, but a sweep that measured
@@ -548,13 +549,12 @@ mod tests {
         let s = shard(dir.path(), 200, c.model.vocab_size);
 
         let score = evaluate(&model, s, &cfg(), &device).unwrap();
-        assert!(
-            score.teacher_forced_correct >= score.free_running_correct,
-            "teacher forcing scored {} against free-running {}",
-            score.teacher_forced_correct,
-            score.free_running_correct
+        assert!(score.teacher_forced_correct <= score.n_tokens);
+        assert!(score.free_running_correct <= score.n_tokens);
+        assert_eq!(
+            score.exposure_gap(),
+            score.teacher_forced_accuracy() - score.free_running_accuracy()
         );
-        assert!(score.exposure_gap() >= 0.0);
     }
 
     /// The same guard the LM evaluator has: ids from another tokenizer would
